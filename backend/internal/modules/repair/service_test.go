@@ -13,6 +13,7 @@ import (
 
 	"streetlight/internal/apperr"
 	"streetlight/internal/modules/fault"
+	"streetlight/internal/modules/inventory"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
 )
@@ -22,6 +23,7 @@ type harness struct {
 	lamps   *lamp.Service
 	faults  *fault.Service
 	repairs *repair.Service
+	stock   *inventory.Service
 	db      *gorm.DB
 }
 
@@ -38,7 +40,8 @@ func newHarness(t *testing.T) *harness {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 
-	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
+	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{},
+		&inventory.SparePart{}, &inventory.StockTransaction{}, &inventory.RepairMaterial{}))
 
 	lampRepository := lamp.NewRepository(db)
 	lampService := lamp.NewService(lampRepository)
@@ -47,10 +50,13 @@ func newHarness(t *testing.T) *harness {
 	faultService := fault.NewService(faultRepository, lampService)
 	lampService.SetOpenFaultCounter(faultRepository)
 
-	repairRepository := repair.NewRepository(db)
-	repairService := repair.NewService(repairRepository, faultService)
+	inventoryRepository := inventory.NewRepository(db)
+	inventoryService := inventory.NewService(inventoryRepository)
 
-	return &harness{lamps: lampService, faults: faultService, repairs: repairService, db: db}
+	repairRepository := repair.NewRepository(db)
+	repairService := repair.NewService(repairRepository, faultService, inventoryService)
+
+	return &harness{lamps: lampService, faults: faultService, repairs: repairService, stock: inventoryService, db: db}
 }
 
 func (h *harness) createLamp(t *testing.T, code string) *lamp.Lamp {
@@ -193,6 +199,66 @@ func TestRepairPendingPartsKeepsFaultProcessing(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, faultAfterSecond.RepairCount)
 }
+
+func TestRepairMaterialDeductionAndRollback(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-T-010")
+	entity := h.createFault(t, device.ID, "驱动电源损坏需更换")
+
+	part, err := h.stock.CreatePart(ctx, inventory.PartCreateRequest{
+		Code: "BJ-TEST-01", Name: "LED 驱动电源", Unit: "个",
+		InitialStock: intPointer(2), SafetyStock: intPointer(1), UnitPrice: floatPointer(150),
+	})
+	require.NoError(t, err)
+
+	// 领用 3 个但库存只有 2 个: 开工被拦, 返回 409 与可用数量
+	_, err = h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: entity.ID, Repairman: "维修工甲",
+		MaterialLines: []inventory.MaterialLine{{PartID: part.ID, Quantity: 3}},
+	})
+	requireConflict(t, err)
+
+	loadedPart, err := h.stock.GetPart(ctx, part.ID)
+	require.NoError(t, err)
+	require.Equal(t, 2, loadedPart.Stock, "开工被拦后库存不应变化")
+
+	faultAfterReject, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, fault.StatusPending, faultAfterReject.Status, "开工被拦后故障应保持待处理")
+	require.Equal(t, 0, faultAfterReject.RepairCount, "开工被拦不应累加维修次数")
+
+	// 领用 2 个正常开工: 库存扣到 0, 维修记录保留用料明细
+	record, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: entity.ID, Repairman: "维修工甲",
+		MaterialLines: []inventory.MaterialLine{{PartID: part.ID, Quantity: 2}},
+	})
+	require.NoError(t, err)
+	require.Len(t, record.MaterialsDetail, 1)
+	require.Equal(t, 2, record.MaterialsDetail[0].Quantity)
+
+	loadedPart, err = h.stock.GetPart(ctx, part.ID)
+	require.NoError(t, err)
+	require.Equal(t, 0, loadedPart.Stock)
+
+	detail, err := h.repairs.Get(ctx, record.ID)
+	require.NoError(t, err)
+	require.Len(t, detail.MaterialsDetail, 1)
+
+	// 删除维修记录: 挂账备件全部回退入库
+	require.NoError(t, h.repairs.Delete(ctx, record.ID))
+	loadedPart, err = h.stock.GetPart(ctx, part.ID)
+	require.NoError(t, err)
+	require.Equal(t, 2, loadedPart.Stock, "删除维修记录后备件应自动回退")
+
+	faultAfterDelete, err := h.faults.GetByID(ctx, entity.ID)
+	require.NoError(t, err)
+	require.Equal(t, fault.StatusPending, faultAfterDelete.Status)
+	require.Equal(t, 0, faultAfterDelete.RepairCount)
+}
+
+func intPointer(v int) *int           { return &v }
+func floatPointer(v float64) *float64 { return &v }
 
 func TestRepairRejectedOnClosedFault(t *testing.T) {
 	ctx := context.Background()

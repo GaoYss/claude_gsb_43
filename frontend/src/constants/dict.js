@@ -48,8 +48,25 @@ export const REPAIR_RESULT = {
 export const TIMELINE_STAGE = {
   reported: { label: '故障登记', type: 'primary' },
   repair_started: { label: '维修开工', type: 'warning' },
+  material_issued: { label: '备件领用', type: 'warning' },
   repair_finished: { label: '维修完成', type: 'success' },
   closed: { label: '故障关闭', type: 'info' },
+}
+
+// 备件档案状态。
+export const PART_STATUS = {
+  active: { label: '在用', type: 'success' },
+  inactive: { label: '停用', type: 'info' },
+}
+
+// 出入库流水类型。
+export const STOCK_TX_TYPE = {
+  inbound: { label: '采购入库', type: 'primary' },
+  issue: { label: '维修领用', type: 'warning' },
+  return: { label: '维修退料', type: 'success' },
+  scrap: { label: '报废', type: 'danger' },
+  rollback: { label: '删除回退', type: 'info' },
+  adjust_out: { label: '盘亏调整', type: 'danger' },
 }
 
 // 取字典项文案。

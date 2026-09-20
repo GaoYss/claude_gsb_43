@@ -2,12 +2,14 @@ package repair
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
 	"streetlight/internal/apperr"
 	"streetlight/internal/modules/fault"
+	"streetlight/internal/modules/inventory"
 	"streetlight/pkg/pagination"
 )
 
@@ -33,20 +35,67 @@ type FaultPort interface {
 	SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error
 }
 
+// InventoryPort 由备件库存模块实现, 维修模块通过它在开工时领用扣减、删除时回退。
+type InventoryPort interface {
+	CheckAvailable(ctx context.Context, lines []inventory.MaterialLine) error
+	ReserveMaterials(ctx context.Context, lines []inventory.MaterialLine, ref inventory.RepairRef) ([]inventory.RepairMaterial, error)
+	RollbackRepair(ctx context.Context, repairID uint) error
+	ListMaterialsByRepair(ctx context.Context, repairID uint) ([]inventory.RepairMaterial, error)
+	ListMaterialsByRepairs(ctx context.Context, repairIDs []uint) (map[uint][]inventory.RepairMaterial, error)
+}
+
 // Service 承载维修记录录入的业务规则。
 type Service struct {
-	repo   *Repository
-	faults FaultPort
+	repo      *Repository
+	faults    FaultPort
+	inventory InventoryPort
 }
 
 // NewService 构造维修记录服务。
-func NewService(repo *Repository, faults FaultPort) *Service {
-	return &Service{repo: repo, faults: faults}
+func NewService(repo *Repository, faults FaultPort, stock InventoryPort) *Service {
+	return &Service{repo: repo, faults: faults, inventory: stock}
+}
+
+// attachMaterials 为维修记录填好用料明细。
+func (s *Service) attachMaterials(ctx context.Context, item *Repair) {
+	if s.inventory == nil {
+		return
+	}
+	materials, err := s.inventory.ListMaterialsByRepair(ctx, item.ID)
+	if err != nil {
+		slog.Warn("查询维修用料明细失败", "repair_id", item.ID, "error", err)
+		return
+	}
+	item.MaterialsDetail = materials
+}
+
+// attachMaterialsBatch 批量为维修记录填好用料明细, 避免列表页 N+1 查询。
+func (s *Service) attachMaterialsBatch(ctx context.Context, items []Repair) {
+	if s.inventory == nil || len(items) == 0 {
+		return
+	}
+	ids := make([]uint, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.ID)
+	}
+	grouped, err := s.inventory.ListMaterialsByRepairs(ctx, ids)
+	if err != nil {
+		slog.Warn("批量查询维修用料明细失败", "error", err)
+		return
+	}
+	for index := range items {
+		items[index].MaterialsDetail = grouped[items[index].ID]
+	}
 }
 
 // Get 查询维修记录详情。
 func (s *Service) Get(ctx context.Context, id uint) (*Repair, error) {
-	return s.repo.GetByID(ctx, id)
+	entity, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	s.attachMaterials(ctx, entity)
+	return entity, nil
 }
 
 // List 分页查询维修记录。
@@ -60,6 +109,7 @@ func (s *Service) List(ctx context.Context, query ListQuery) ([]Repair, int64, p
 	if err != nil {
 		return nil, 0, page, err
 	}
+	s.attachMaterialsBatch(ctx, items)
 	return items, total, page, nil
 }
 
@@ -68,10 +118,16 @@ func (s *Service) ListByFault(ctx context.Context, faultID uint) ([]Repair, erro
 	if _, err := s.faults.GetByID(ctx, faultID); err != nil {
 		return nil, err
 	}
-	return s.repo.ListByFault(ctx, faultID)
+	items, err := s.repo.ListByFault(ctx, faultID)
+	if err != nil {
+		return nil, err
+	}
+	s.attachMaterialsBatch(ctx, items)
+	return items, nil
 }
 
 // Create 录入维修记录(维修开工), 并联动故障与路灯状态。
+// 提交备件领用明细时先校验库存: 库存不足直接拦住开工并返回各备件的可用数量。
 func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error) {
 	target, err := s.faults.GetByID(ctx, req.FaultID)
 	if err != nil {
@@ -105,6 +161,14 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error
 		return nil, apperr.BadRequest("开工时间不能早于故障上报时间 %s", target.ReportedAt.Format("2006-01-02 15:04:05"))
 	}
 
+	// 开工前预检库存, 库存不足时不落任何数据, 直接返回可用数量提示。
+	if s.inventory != nil {
+		if err := s.inventory.CheckAvailable(ctx, req.MaterialLines); err != nil {
+			return nil, err
+		}
+	}
+
+	materialsText := strings.TrimSpace(req.Materials)
 	entity := &Repair{
 		FaultID:      target.ID,
 		FaultNo:      target.FaultNo,
@@ -116,7 +180,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error
 		StartedAt:    startedAt,
 		Status:       StatusOngoing,
 		Content:      strings.TrimSpace(req.Content),
-		Materials:    strings.TrimSpace(req.Materials),
+		Materials:    materialsText,
 		Cost:         valueOrZero(req.Cost),
 		Remark:       strings.TrimSpace(req.Remark),
 	}
@@ -130,8 +194,74 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Repair, error
 		return nil, err
 	}
 
+	// 领用备件并扣减库存(事务内加锁)。极端并发下若预检后库存被占用, 回滚刚创建的维修单。
+	if s.inventory != nil && len(req.MaterialLines) > 0 {
+		materials, err := s.inventory.ReserveMaterials(ctx, req.MaterialLines, inventory.RepairRef{
+			ID:         entity.ID,
+			RepairNo:   entity.RepairNo,
+			FaultID:    target.ID,
+			FaultNo:    target.FaultNo,
+			LampID:     target.LampID,
+			LampCode:   target.LampCode,
+			Operator:   repairman,
+			OccurredAt: startedAt,
+		})
+		if err != nil {
+			s.compensateFailedStart(ctx, entity)
+			return nil, err
+		}
+		entity.MaterialsDetail = materials
+		if materialsText == "" {
+			entity.Materials = summarizeMaterials(materials)
+			if err := s.repo.Update(ctx, entity); err != nil {
+				slog.Warn("回填维修耗材摘要失败", "repair_id", entity.ID, "error", err)
+			}
+		}
+	}
+
 	entity.FillDuration()
 	return entity, nil
+}
+
+// compensateFailedStart 库存扣减失败时撤销维修单并恢复故障的维修统计, 避免残留脏数据。
+func (s *Service) compensateFailedStart(ctx context.Context, entity *Repair) {
+	if err := s.repo.Delete(ctx, entity.ID); err != nil {
+		slog.Error("库存扣减失败后回滚维修记录失败", "repair_id", entity.ID, "error", err)
+		return
+	}
+	count, err := s.repo.CountByFault(ctx, entity.FaultID)
+	if err != nil {
+		slog.Error("库存扣减失败后重算故障维修次数失败", "fault_id", entity.FaultID, "error", err)
+		return
+	}
+	latest, err := s.repo.LatestByFault(ctx, entity.FaultID)
+	if err != nil {
+		slog.Error("库存扣减失败后查询最新维修记录失败", "fault_id", entity.FaultID, "error", err)
+		return
+	}
+	var latestID *uint
+	if latest != nil {
+		latestID = &latest.ID
+	}
+	if err := s.faults.SyncRepairStats(ctx, entity.FaultID, int(count), latestID); err != nil {
+		slog.Error("库存扣减失败后同步故障统计失败", "fault_id", entity.FaultID, "error", err)
+	}
+}
+
+// summarizeMaterials 依据领用明细生成耗材文本摘要, 兼容旧的耗材字段展示。
+func summarizeMaterials(materials []inventory.RepairMaterial) string {
+	if len(materials) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(materials))
+	for _, item := range materials {
+		parts = append(parts, fmt.Sprintf("%s %d%s", item.PartName, item.Quantity, item.Unit))
+	}
+	summary := strings.Join(parts, ", ")
+	if len(summary) > 255 {
+		return summary[:255]
+	}
+	return summary
 }
 
 // Update 修改维修记录, 已完成的记录不允许修改。
@@ -180,6 +310,7 @@ func (s *Service) Update(ctx context.Context, id uint, req UpdateRequest) (*Repa
 	if err := s.repo.Update(ctx, entity); err != nil {
 		return nil, err
 	}
+	s.attachMaterials(ctx, entity)
 	entity.FillDuration()
 	return entity, nil
 }
@@ -231,11 +362,13 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 		return nil, err
 	}
 
+	s.attachMaterials(ctx, entity)
 	entity.FillDuration()
 	return entity, nil
 }
 
 // Delete 删除维修记录, 已关闭故障的维修记录不允许删除。
+// 删除时通过库存端口把仍挂账的领用备件自动回退入库, 并清理用料明细。
 func (s *Service) Delete(ctx context.Context, id uint) error {
 	entity, err := s.repo.GetByID(ctx, id)
 	if err != nil {
@@ -247,6 +380,13 @@ func (s *Service) Delete(ctx context.Context, id uint) error {
 	}
 	if target.Status == fault.StatusClosed {
 		return apperr.Conflict("故障 %s 已关闭, 不允许删除其维修记录", target.FaultNo)
+	}
+
+	// 先回退库存(事务内加锁, 失败则整个删除中止), 再删除维修单。
+	if s.inventory != nil {
+		if err := s.inventory.RollbackRepair(ctx, id); err != nil {
+			return err
+		}
 	}
 
 	if err := s.repo.Delete(ctx, id); err != nil {

@@ -54,6 +54,22 @@
         color="#409eff"
         :hint="`故障累计 ${overview.fault.total} 条`"
       />
+      <StatCard
+        label="缺货备件"
+        :value="overview.inventory.shortage_total"
+        suffix="种"
+        icon="Box"
+        color="#f56c6c"
+        :hint="`在库 ${overview.inventory.total_stock_qty} 件, 低于安全库存需补货`"
+      />
+      <StatCard
+        label="在库金额"
+        :value="overview.inventory.total_stock_value"
+        suffix="元"
+        icon="Wallet"
+        color="#909399"
+        :hint="`备件品种 ${overview.inventory.part_total} 种`"
+      />
     </div>
 
     <el-row :gutter="16">
@@ -123,6 +139,63 @@
       <div class="section-title">故障高发道路 TOP5</div>
       <BarList :items="overview.top_roads" />
     </el-card>
+
+    <el-row :gutter="16">
+      <el-col :xs="24" :md="12">
+        <el-card shadow="never">
+          <div class="section-title">
+            <span>备件消耗排名 TOP10</span>
+            <el-button link type="primary" @click="$router.push('/inventory/transactions')">出入库流水</el-button>
+          </div>
+          <el-table :data="overview.part_consumption" size="small">
+            <el-table-column type="index" label="#" width="42" />
+            <el-table-column prop="part_name" label="备件名称" min-width="130" show-overflow-tooltip />
+            <el-table-column prop="part_code" label="编号" width="90" />
+            <el-table-column label="净消耗" width="100">
+              <template #default="{ row }">
+                <span class="consumed-qty">{{ row.consumed_qty }} {{ row.unit }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="领用/退料" width="110">
+              <template #default="{ row }">
+                <span class="text-muted">{{ row.issued_qty }} / {{ row.returned_qty }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="维修次数" width="80">
+              <template #default="{ row }">{{ row.repair_count }}</template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-if="!overview.part_consumption?.length" description="暂无备件消耗数据" :image-size="60" />
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :md="12">
+        <el-card shadow="never">
+          <div class="section-title">
+            <span>缺货预警</span>
+            <el-tag type="danger" effect="plain" size="small">{{ overview.inventory.shortage_total }} 种待补货</el-tag>
+          </div>
+          <el-table :data="overview.shortage_parts" size="small" @row-click="goInventory">
+            <el-table-column prop="code" label="编号" width="90" />
+            <el-table-column prop="name" label="备件名称" min-width="120" show-overflow-tooltip />
+            <el-table-column prop="spec" label="规格" min-width="110" show-overflow-tooltip />
+            <el-table-column label="当前库存" width="90">
+              <template #default="{ row }">
+                <span class="shortage-stock">{{ row.stock }} {{ row.unit }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="安全库存" width="90">
+              <template #default="{ row }">{{ row.safety_stock }} {{ row.unit }}</template>
+            </el-table-column>
+            <el-table-column label="建议补货" width="90">
+              <template #default="{ row }">
+                <el-tag type="danger" size="small">≥ {{ row.gap }} {{ row.unit }}</el-tag>
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-if="!overview.shortage_parts?.length" description="库存充足, 暂无缺货" :image-size="60" />
+        </el-card>
+      </el-col>
+    </el-row>
   </div>
 </template>
 
@@ -145,9 +218,12 @@ const emptyOverview = () => ({
   lamp: { total: 0, road_count: 0, by_run_status: {} },
   fault: { total: 0, open_total: 0, by_status: {}, today_reported: 0, overdue_total: 0 },
   repair: { total: 0, ongoing_total: 0, finished_total: 0, today_finished: 0, average_duration_hours: 0, total_cost: 0 },
+  inventory: { part_total: 0, shortage_total: 0, total_stock_qty: 0, total_stock_value: 0 },
   fault_by_type: [],
   fault_by_level: [],
   top_roads: [],
+  part_consumption: [],
+  shortage_parts: [],
   recent_faults: [],
   overdue_faults: [],
   overdue_threshold_hours: 24,
@@ -187,5 +263,21 @@ function goTrack(row) {
   router.push({ path: '/status/track', query: { fault_no: row.fault_no } })
 }
 
+function goInventory() {
+  router.push({ path: '/inventory', query: { shortage: 1 } })
+}
+
 onMounted(load)
 </script>
+
+<style scoped>
+.consumed-qty {
+  font-weight: 600;
+  color: #e6a23c;
+}
+
+.shortage-stock {
+  font-weight: 600;
+  color: #f56c6c;
+}
+</style>

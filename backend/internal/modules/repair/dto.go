@@ -1,18 +1,22 @@
 package repair
 
-import "streetlight/pkg/pagination"
+import (
+	"streetlight/internal/modules/inventory"
+	"streetlight/pkg/pagination"
+)
 
 // CreateRequest 维修记录录入请求。
 type CreateRequest struct {
-	FaultID      uint     `json:"fault_id" binding:"required"`
-	Repairman    string   `json:"repairman" binding:"required,max=64"`
-	RepairTeam   string   `json:"repair_team" binding:"max=64"`
-	ContactPhone string   `json:"contact_phone" binding:"max=32"`
-	StartedAt    string   `json:"started_at" binding:"omitempty,max=32"`
-	Content      string   `json:"content" binding:"max=512"`
-	Materials    string   `json:"materials" binding:"max=255"`
-	Cost         *float64 `json:"cost" binding:"omitempty,min=0"`
-	Remark       string   `json:"remark" binding:"max=255"`
+	FaultID       uint                     `json:"fault_id" binding:"required"`
+	Repairman     string                   `json:"repairman" binding:"required,max=64"`
+	RepairTeam    string                   `json:"repair_team" binding:"max=64"`
+	ContactPhone  string                   `json:"contact_phone" binding:"max=32"`
+	StartedAt     string                   `json:"started_at" binding:"omitempty,max=32"`
+	Content       string                   `json:"content" binding:"max=512"`
+	Materials     string                   `json:"materials" binding:"max=255"`
+	MaterialLines []inventory.MaterialLine `json:"material_lines" binding:"omitempty,dive"`
+	Cost          *float64                 `json:"cost" binding:"omitempty,min=0"`
+	Remark        string                   `json:"remark" binding:"max=255"`
 }
 
 // UpdateRequest 修改维修记录, 仅未完成的记录允许修改。

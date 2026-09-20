@@ -1,6 +1,10 @@
 package repair
 
-import "time"
+import (
+	"time"
+
+	"streetlight/internal/modules/inventory"
+)
 
 // 维修记录状态。
 const (
@@ -58,6 +62,9 @@ type Repair struct {
 
 	// DurationMinutes 仅用于响应展示的维修耗时(分钟), 不落库。
 	DurationMinutes *int64 `gorm:"-" json:"duration_minutes,omitempty"`
+
+	// MaterialsDetail 开工领用的备件与耗材明细, 来自库存模块, 不落本表。
+	MaterialsDetail []inventory.RepairMaterial `gorm:"-" json:"materials_detail,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

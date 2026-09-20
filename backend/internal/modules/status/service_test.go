@@ -11,6 +11,7 @@ import (
 	"gorm.io/gorm/schema"
 
 	"streetlight/internal/modules/fault"
+	"streetlight/internal/modules/inventory"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
 	"streetlight/internal/modules/status"
@@ -36,7 +37,8 @@ func newHarness(t *testing.T) *harness {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 
-	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
+	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{},
+		&inventory.SparePart{}, &inventory.StockTransaction{}, &inventory.RepairMaterial{}))
 
 	lampRepository := lamp.NewRepository(db)
 	lampService := lamp.NewService(lampRepository)
@@ -45,14 +47,17 @@ func newHarness(t *testing.T) *harness {
 	faultService := fault.NewService(faultRepository, lampService)
 	lampService.SetOpenFaultCounter(faultRepository)
 
+	inventoryRepository := inventory.NewRepository(db)
+	inventoryService := inventory.NewService(inventoryRepository)
+
 	repairRepository := repair.NewRepository(db)
-	repairService := repair.NewService(repairRepository, faultService)
+	repairService := repair.NewService(repairRepository, faultService, inventoryService)
 
 	return &harness{
 		lamps:   lampService,
 		faults:  faultService,
 		repairs: repairService,
-		status:  status.NewService(db, lampRepository, faultRepository, repairRepository),
+		status:  status.NewService(db, lampRepository, faultRepository, repairRepository, inventoryRepository),
 	}
 }
 

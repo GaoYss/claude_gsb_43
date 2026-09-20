@@ -2,6 +2,7 @@ package status
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"streetlight/internal/apperr"
 	"streetlight/internal/modules/fault"
+	"streetlight/internal/modules/inventory"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
 	"streetlight/pkg/pagination"
@@ -49,17 +51,24 @@ type TrackQuery struct {
 }
 
 // Service 提供跨模块的维修状态查询能力(只读)。
-// 作为读模型, 它直接基于 lamp / fault / repair 三张表组装视图, 避免不必要的多次往返查询。
+// 作为读模型, 它直接基于 lamp / fault / repair / inventory 表组装视图, 避免不必要的多次往返查询。
 type Service struct {
 	db      *gorm.DB
 	lamps   *lamp.Repository
 	faults  *fault.Repository
 	repairs *repair.Repository
+	stock   *inventory.Repository
 }
 
 // NewService 构造维修状态查询服务。
-func NewService(db *gorm.DB, lamps *lamp.Repository, faults *fault.Repository, repairs *repair.Repository) *Service {
-	return &Service{db: db, lamps: lamps, faults: faults, repairs: repairs}
+func NewService(
+	db *gorm.DB,
+	lamps *lamp.Repository,
+	faults *fault.Repository,
+	repairs *repair.Repository,
+	stock *inventory.Repository,
+) *Service {
+	return &Service{db: db, lamps: lamps, faults: faults, repairs: repairs, stock: stock}
 }
 
 // Overview 汇总维修状态看板数据。
@@ -136,6 +145,27 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 		return nil, err
 	}
 
+	partTotal, _, err := s.stock.CountParts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	shortageTotal, err := s.stock.CountShortage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stockQty, stockValue, err := s.stock.StockTotals(ctx)
+	if err != nil {
+		return nil, err
+	}
+	topConsumption, err := s.stock.ConsumptionRanking(ctx, 10)
+	if err != nil {
+		return nil, err
+	}
+	shortageParts, err := s.stock.ListShortage(ctx, 10)
+	if err != nil {
+		return nil, err
+	}
+
 	recentFaults, err := s.faults.ListRecent(ctx, 8)
 	if err != nil {
 		return nil, err
@@ -166,14 +196,38 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 			AverageDurationHr: round2(averageDuration),
 			TotalCost:         round2(totalCost),
 		},
-		FaultByType:   topCounts(faultByType, 0),
-		FaultByLevel:  orderedCounts(faultByLevel, fault.Levels()),
-		TopRoads:      topCounts(faultByRoad, 5),
-		RecentFaults:  toBriefs(recentFaults),
-		OverdueFaults: toBriefs(overdueFaults),
-		OverdueHours:  OverdueThreshold.Hours(),
-		GeneratedAt:   now,
+		Inventory: InventorySummary{
+			PartTotal:       partTotal,
+			ShortageTotal:   shortageTotal,
+			TotalStockQty:   stockQty,
+			TotalStockValue: round2(stockValue),
+		},
+		FaultByType:     topCounts(faultByType, 0),
+		FaultByLevel:    orderedCounts(faultByLevel, fault.Levels()),
+		TopRoads:        topCounts(faultByRoad, 5),
+		PartConsumption: topConsumption,
+		ShortageParts:   toShortageItems(shortageParts),
+		RecentFaults:    toBriefs(recentFaults),
+		OverdueFaults:   toBriefs(overdueFaults),
+		OverdueHours:    OverdueThreshold.Hours(),
+		GeneratedAt:     now,
 	}, nil
+}
+
+// toShortageItems 把缺货备件转换为看板提示行, 并计算补货缺口。
+func toShortageItems(parts []inventory.SparePart) []inventory.ShortageItem {
+	items := make([]inventory.ShortageItem, 0, len(parts))
+	for _, part := range parts {
+		gap := part.SafetyStock + 1 - part.Stock
+		if gap < 1 {
+			gap = 1
+		}
+		items = append(items, inventory.ShortageItem{
+			ID: part.ID, Code: part.Code, Name: part.Name, Spec: part.Spec, Unit: part.Unit,
+			Stock: part.Stock, SafetyStock: part.SafetyStock, Gap: gap,
+		})
+	}
+	return items
 }
 
 // Lamps 查询路灯维修状态列表: 在台账信息之上叠加当前故障与最近一次维修进展。
@@ -316,9 +370,14 @@ func (s *Service) Track(ctx context.Context, query TrackQuery) (*TrackResult, er
 			if err != nil {
 				return nil, err
 			}
+			materials, err := s.listMaterialMap(ctx, repairs)
+			if err != nil {
+				return nil, err
+			}
 			result.Fault = &latest
 			result.Repairs = repairs
-			result.Timeline = buildTimeline(&latest, repairs)
+			result.Materials = materials
+			result.Timeline = buildTimeline(&latest, repairs, materials)
 		}
 		return result, nil
 
@@ -337,13 +396,30 @@ func (s *Service) buildFaultTrack(ctx context.Context, entity *fault.Fault) (*Tr
 	if err != nil {
 		return nil, err
 	}
+	materials, err := s.listMaterialMap(ctx, repairs)
+	if err != nil {
+		return nil, err
+	}
 	return &TrackResult{
 		SearchType: "fault",
 		Lamp:       device,
 		Fault:      entity,
 		Repairs:    repairs,
-		Timeline:   buildTimeline(entity, repairs),
+		Materials:  materials,
+		Timeline:   buildTimeline(entity, repairs, materials),
 	}, nil
+}
+
+// listMaterialMap 按维修单 ID 组装用料明细映射, 供追踪视图展示。
+func (s *Service) listMaterialMap(ctx context.Context, repairs []repair.Repair) (map[uint][]inventory.RepairMaterial, error) {
+	if len(repairs) == 0 {
+		return map[uint][]inventory.RepairMaterial{}, nil
+	}
+	ids := make([]uint, 0, len(repairs))
+	for _, item := range repairs {
+		ids = append(ids, item.ID)
+	}
+	return s.stock.ListMaterialsByRepairs(ctx, ids)
 }
 
 // countFaultsByLamp 批量统计每盏路灯的故障数量, openOnly 为 true 时仅统计未闭环故障。
@@ -411,8 +487,8 @@ func (s *Service) latestRepairs(ctx context.Context, lampIDs []uint) (map[uint]r
 	return result, nil
 }
 
-// buildTimeline 依据故障与维修记录构建处置时间线。
-func buildTimeline(entity *fault.Fault, repairs []repair.Repair) []TimelineEvent {
+// buildTimeline 依据故障、维修记录与用料明细构建处置时间线。
+func buildTimeline(entity *fault.Fault, repairs []repair.Repair, materials map[uint][]inventory.RepairMaterial) []TimelineEvent {
 	events := make([]TimelineEvent, 0, len(repairs)*2+2)
 
 	events = append(events, TimelineEvent{
@@ -431,6 +507,15 @@ func buildTimeline(entity *fault.Fault, repairs []repair.Repair) []TimelineEvent
 			Detail:    strings.TrimSpace(item.RepairNo + " " + item.Content),
 			Timestamp: item.StartedAt,
 		})
+		if lines := materialSummary(materials[item.ID]); lines != "" {
+			events = append(events, TimelineEvent{
+				Stage:     "material_issued",
+				Label:     "备件领用",
+				Operator:  item.Repairman,
+				Detail:    lines,
+				Timestamp: item.StartedAt,
+			})
+		}
 		if item.FinishedAt != nil {
 			detail := item.RepairNo
 			if item.Result != "" {
@@ -462,6 +547,22 @@ func buildTimeline(entity *fault.Fault, repairs []repair.Repair) []TimelineEvent
 		return events[i].Timestamp.Before(events[j].Timestamp)
 	})
 	return events
+}
+
+// materialSummary 把某次维修的备件领用明细拼成时间线文案, 含退料/报废进度。
+func materialSummary(lines []inventory.RepairMaterial) string {
+	if len(lines) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(lines))
+	for _, line := range lines {
+		text := fmt.Sprintf("%s %d%s", line.PartName, line.Quantity, line.Unit)
+		if line.ReturnedQty > 0 || line.ScrappedQty > 0 {
+			text += fmt.Sprintf("(退 %d/废 %d)", line.ReturnedQty, line.ScrappedQty)
+		}
+		parts = append(parts, text)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // orderedCounts 按给定顺序输出分组统计, 保证前端展示顺序稳定且包含零值项。

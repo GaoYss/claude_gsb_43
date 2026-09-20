@@ -71,6 +71,14 @@
           <el-table-column label="完工时间" width="140">
             <template #default="{ row }">{{ formatDateTime(row.finished_at) }}</template>
           </el-table-column>
+          <el-table-column label="备件用料" min-width="150">
+            <template #default="{ row }">
+              <span v-if="detail.materials?.[row.id]?.length">
+                {{ detail.materials[row.id].map((line) => `${line.part_name}×${line.quantity - line.returned_qty}${line.unit}`).join('，') }}
+              </span>
+              <span v-else class="text-muted">{{ row.materials || '-' }}</span>
+            </template>
+          </el-table-column>
           <el-table-column prop="content" label="维修内容" min-width="160" show-overflow-tooltip />
         </el-table>
       </template>
@@ -94,7 +102,7 @@ const props = defineProps({
 defineEmits(['update:modelValue'])
 
 const loading = ref(false)
-const detail = ref({ fault: null, lamp: null, repairs: [], timeline: [] })
+const detail = ref({ fault: null, lamp: null, repairs: [], materials: {}, timeline: [] })
 
 // 打开抽屉时按故障 ID 拉取完整处理链路。
 async function load() {
@@ -103,7 +111,7 @@ async function load() {
   try {
     detail.value = await statusApi.track({ fault_id: props.faultId })
   } catch (error) {
-    detail.value = { fault: null, lamp: null, repairs: [], timeline: [] }
+    detail.value = { fault: null, lamp: null, repairs: [], materials: {}, timeline: [] }
   } finally {
     loading.value = false
   }

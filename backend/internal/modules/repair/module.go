@@ -12,10 +12,10 @@ type Module struct {
 	handler    *Handler
 }
 
-// New 构造维修记录模块, faults 为故障模块提供的端口实现。
-func New(db *gorm.DB, faults FaultPort) *Module {
+// New 构造维修记录模块, faults 为故障模块提供的端口实现, stock 为备件库存模块端口。
+func New(db *gorm.DB, faults FaultPort, stock InventoryPort) *Module {
 	repository := NewRepository(db)
-	service := NewService(repository, faults)
+	service := NewService(repository, faults, stock)
 	return &Module{
 		repository: repository,
 		service:    service,

@@ -78,7 +78,37 @@
 
       <el-card shadow="never">
         <div class="section-title">维修记录明细</div>
-        <el-table :data="result.repairs" size="small" border>
+        <el-table :data="result.repairs" size="small" border row-key="repair_no">
+          <el-table-column type="expand">
+            <template #default="{ row }">
+              <div class="material-expand">
+                <div class="text-muted material-expand__title">备件用料明细</div>
+                <el-table :data="result.materials?.[row.id] ?? []" size="small" border>
+                  <el-table-column prop="part_code" label="备件编号" width="100" />
+                  <el-table-column prop="part_name" label="备件名称" min-width="130" show-overflow-tooltip />
+                  <el-table-column prop="spec" label="规格" min-width="120" show-overflow-tooltip />
+                  <el-table-column label="领用量" width="90">
+                    <template #default="{ row: line }">{{ line.quantity }} {{ line.unit }}</template>
+                  </el-table-column>
+                  <el-table-column label="已退料" width="90">
+                    <template #default="{ row: line }">{{ line.returned_qty }} {{ line.unit }}</template>
+                  </el-table-column>
+                  <el-table-column label="已报废" width="90">
+                    <template #default="{ row: line }">{{ line.scrapped_qty }} {{ line.unit }}</template>
+                  </el-table-column>
+                  <el-table-column label="净消耗" width="90">
+                    <template #default="{ row: line }">
+                      <strong>{{ line.quantity - line.returned_qty }} {{ line.unit }}</strong>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="小计金额" width="100">
+                    <template #default="{ row: line }">{{ formatMoney(line.subtotal) }}</template>
+                  </el-table-column>
+                </el-table>
+                <el-empty v-if="!(result.materials?.[row.id]?.length)" description="未领用台账备件" :image-size="50" />
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column prop="repair_no" label="维修单号" width="150" />
           <el-table-column prop="repairman" label="维修人员" width="110" />
           <el-table-column prop="repair_team" label="班组" width="140" />
@@ -97,7 +127,15 @@
           <el-table-column label="耗时" width="120">
             <template #default="{ row }">{{ formatDuration(row.duration_minutes) }}</template>
           </el-table-column>
-          <el-table-column prop="materials" label="耗材" min-width="140" show-overflow-tooltip />
+          <el-table-column label="用料" width="70">
+            <template #default="{ row }">
+              <el-tag v-if="result.materials?.[row.id]?.length" size="small" type="warning">
+                {{ result.materials[row.id].length }} 种
+              </el-tag>
+              <span v-else class="text-muted">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column prop="materials" label="耗材备注" min-width="140" show-overflow-tooltip />
           <el-table-column label="费用" width="100">
             <template #default="{ row }">{{ formatMoney(row.cost) }}</template>
           </el-table-column>
@@ -215,5 +253,15 @@ onMounted(() => {
 <style scoped>
 .timeline-title {
   font-weight: 600;
+}
+
+.material-expand {
+  padding: 8px 16px;
+  background-color: #fafafa;
+}
+
+.material-expand__title {
+  margin-bottom: 8px;
+  font-size: 13px;
 }
 </style>

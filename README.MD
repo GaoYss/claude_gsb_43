@@ -16,10 +16,11 @@
 | --- | --- | --- |
 | 路灯台账 | 路灯基础档案维护 | 编号/道路/运行状态/灯具类型筛选, 按道路与状态统计, 删除前校验未闭环故障 |
 | 故障登记 | 故障工单登记与流转 | 自动生成故障单号, 紧急程度分级, 状态机流转, 闭环关闭 |
-| 维修记录录入 | 针对故障单登记维修过程 | 自动生成维修单号, 开工/完工时间, 耗材与费用, 四种维修结果 |
-| 维修状态查询 | 只读的综合看板与追踪视图 | 全局概览, 路灯级维修状态列表, 按故障单号/路灯编号的全链路时间线 |
+| 维修记录录入 | 针对故障单登记维修过程 | 自动生成维修单号, 开工/完工时间, 备件领用与费用, 四种维修结果 |
+| 备件与耗材库存 | 独立的备件库存台账 | 备件档案/安全库存, 开工自动扣减, 库存不足拦截开工并提示可用数量, 退料与报废登记原因, 出入库流水 |
+| 维修状态查询 | 只读的综合看板与追踪视图 | 全局概览(含备件消耗排名与缺货提示), 路灯级维修状态列表, 按故障单号/路灯编号的全链路时间线 |
 
-四个模块在后端是四个平级的独立包 (`internal/modules/{lamp,fault,repair,status}`), 在前端是四组独立的视图与子组件, 互不耦合; 新增一个业务模块只需要实现 `module.Module` 接口并注册。
+五个模块在后端是五个平级的独立包 (`internal/modules/{lamp,fault,repair,inventory,status}`), 在前端是五组独立的视图与子组件, 互不耦合; 新增一个业务模块只需要实现 `module.Module` 接口并注册。
 
 ---
 
@@ -45,6 +46,7 @@
 │   │   │   ├── lamp/                     #   路灯台账
 │   │   │   ├── fault/                    #   故障登记
 │   │   │   ├── repair/                   #   维修记录录入
+│   │   │   ├── inventory/                #   备件与耗材库存(台账/流水/维修用料)
 │   │   │   └── status/                   #   维修状态查询(只读, 不建表)
 │   │   ├── response/                     # 统一响应信封 Envelope / PageData / OK / Fail
 │   ├── pkg/pagination/                   # 分页与排序参数(排序字段白名单)
@@ -67,7 +69,8 @@
 │   │       ├── dashboard/DashboardView.vue
 │   │       ├── lamp/LampListView.vue + components/LampFormDialog.vue
 │   │       ├── fault/FaultListView.vue + components/{FaultFormDialog,FaultDetailDrawer}.vue
-│   │       ├── repair/RepairListView.vue + components/{RepairFormDialog,FinishRepairDialog}.vue
+│   │       ├── repair/RepairListView.vue + components/{RepairFormDialog,FinishRepairDialog,RepairMaterialsDrawer}.vue
+│   │       ├── inventory/PartListView.vue + TransactionListView.vue + components/{PartFormDialog,StockActionDialog,TransactionDrawer}.vue
 │   │       └── status/{StatusLampView,StatusTrackView}.vue
 │   ├── nginx.conf                        # 生产: SPA 回退 + /api 反向代理
 │   ├── Dockerfile
@@ -104,8 +107,9 @@ modules/<name>/
 ```text
 lamp.New(db)                                   -> 路灯台账(无依赖)
 fault.New(db, lampService)                     -> 故障登记(读取路灯校验)
-repair.New(db, faultService)                   -> 维修记录(驱动故障状态流转)
-status.New(db, lampRepo, faultRepo, repairRepo)-> 维修状态查询(只读聚合)
+inventory.New(db)                              -> 备件库存(独立台账, 无业务依赖)
+repair.New(db, faultService, inventoryService) -> 维修记录(驱动故障状态流转 + 开工资扣减库存)
+status.New(db, lampRepo, faultRepo, repairRepo, inventoryRepo) -> 维修状态查询(只读聚合)
 ```
 
 路灯运行状态需要根据故障反向回填, 但 `lamp` 不能依赖 `fault`, 因此用 `lampService.SetOpenFaultCounter(faultModule.Repository())` 注入一个统计端口, 避免构造函数循环依赖。
@@ -275,34 +279,61 @@ go test ./...
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/repairs` | 分页查询(状态/结果/维修人/班组) |
-| POST | `/repairs` | 录入维修记录(即开工; 同一故障已有进行中记录时返回 409) |
+| POST | `/repairs` | 录入维修记录(即开工; 同一故障已有进行中记录时返回 409; 领用备件库存不足时返回 409 并在 `details` 中给出各备件可用数量) |
 | GET | `/repairs/meta` | 字典: 状态/结果 |
 | GET | `/repairs/statistics` | 维修统计(次数/平均耗时/费用) |
-| GET | `/repairs/fault/:faultId` | 某故障下的全部维修记录 |
-| GET | `/repairs/:id` | 详情 |
+| GET | `/repairs/fault/:faultId` | 某故障下的全部维修记录(含用料明细) |
+| GET | `/repairs/:id` | 详情(含用料明细) |
 | PUT | `/repairs/:id` | 修改 |
 | POST | `/repairs/:id/finish` | 完工(写入完工时间与维修结果) |
-| DELETE | `/repairs/:id` | 删除(会重算故障的维修次数) |
+| DELETE | `/repairs/:id` | 删除(会重算故障维修次数, 并自动把挂账备件回退入库) |
+
+### 备件与耗材库存
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/inventory/parts` | 分页查询备件台账(关键字/分类/状态/仅看缺货) |
+| POST | `/inventory/parts` | 新增备件(期初库存大于 0 时自动生成入库流水) |
+| GET | `/inventory/parts/options` | 开工选择备件的下拉数据(含实时可用库存)与建议编号 |
+| GET | `/inventory/parts/meta` | 字典: 出入库类型/备件状态 |
+| GET | `/inventory/parts/statistics` | 库存统计(品种/缺货数/在库总量与金额) |
+| GET | `/inventory/parts/consumption` | 备件消耗排名(按净消耗量) |
+| GET | `/inventory/parts/shortage` | 缺货预警清单(低于安全库存) |
+| GET | `/inventory/parts/:id` | 详情 |
+| PUT | `/inventory/parts/:id` | 修改档案(库存不可直接编辑) |
+| DELETE | `/inventory/parts/:id` | 删除(有库存或流水时返回 409) |
+| POST | `/inventory/parts/:id/inbound` | 采购入库(可带单价, 按移动加权平均刷新成本) |
+| POST | `/inventory/parts/:id/scrap` | 库存报废(必须登记原因, 数量不得超过库存) |
+| GET | `/inventory/transactions` | 出入库流水查询(类型/备件/维修单/故障单/时间区间) |
+| GET | `/inventory/materials/repair/:repairId` | 某次维修的用料明细 |
+| POST | `/inventory/materials/:id/return` | 维修退料(必须登记原因, 备件回补库存) |
+| POST | `/inventory/materials/:id/scrap` | 维修现场报废(必须登记原因, 库存不再变动只留痕) |
 
 ### 维修状态查询
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/status/overview` | 全局概览: 台账/故障/维修汇总 + 类型与道路分布 + 逾期清单 |
+| GET | `/status/overview` | 全局概览: 台账/故障/维修/库存汇总 + 类型与道路分布 + 备件消耗排名 + 缺货提示 + 逾期清单 |
 | GET | `/status/lamps` | 路灯级维修状态列表(可只看未闭环) |
-| GET | `/status/track` | 全链路追踪, 参数 `fault_no` 或 `lamp_code` |
+| GET | `/status/track` | 全链路追踪, 参数 `fault_no` 或 `lamp_code`(返回按维修单分组的备件用料) |
 
 ---
 
 ## 八、业务规则
 
 - **单号**: 故障单 `GD + YYYYMMDD + 4 位序号`, 维修单 `WX + YYYYMMDD + 4 位序号`, 唯一索引冲突时自动重试。
+- **流水单号**: 入库 `RK` / 领用 `LY` / 退料 `TL` / 报废 `BF` / 删除回退 `HC` + `YYYYMMDD + 4 位序号`。
 - **一灯一单**: 同一路灯同时只允许一条未闭环故障(409); 同一故障同时只允许一条进行中维修记录(409)。
 - **故障状态机**: `待处理 -> 维修中 -> 已修复 -> 已关闭`; 已关闭的故障拒绝任何再操作; 允许 `已修复 -> 维修中` 回退。
 - **维修结果**: 只有 `已修复(fixed)` 会把故障推进到 `已修复`, 其余结果保持 `维修中`。
 - **路灯运行状态自动联动**: 存在 `维修中` 故障 -> `维修中(maintenance)`; 存在 `待处理` 故障 -> `故障(fault)`; 否则 -> `正常(normal)`; `停用(offline)` 由人工维护。
-- **删除维修记录** 会重算故障的 `repair_count` / `latest_repair_id`, 次数归零时把故障从 `维修中` 回退到 `待处理`。
-- **删除路灯** 会被未闭环故障拦截; **删除故障** 要求已关闭且没有维修记录。
+- **备件库存自成台账**: 备件有独立编号、分类、规格、计量单位、安全库存与移动加权单价; 库存数量只能通过出入库流水变动, 编辑档案不影响库存。
+- **开工自动扣减**: 维修开工提交领用明细后, 在一个数据库事务内按备件加行锁扣减库存并写入领用流水与维修用料明细; 库存不足(或备件停用)时**直接拦住开工**, 返回 409 并在响应 `details` 中逐种备件给出 `need` 与当前 `available` 可用数量, 不落任何脏数据; 极端并发下扣减失败会自动撤销刚创建的维修单。
+- **退料与报废**: 退料把未使用备件按数量回补可用库存并写退料流水; 现场报废针对已出库的备件登记, 库存不再二次变动, 只写库存增量为 0 的报废流水; 两者都**必须填写原因**, 且数量不能超过维修单上仍挂账(未退未废)的数量。
+- **维修记录保留用料明细**: 每次开工领用生成 `repair_material` 明细(备件快照、领用/累计退料/累计报废/净消耗/小计), 维修详情、列表与状态追踪均可展开查看, 不随耗材文本备注丢失。
+- **消耗排名与缺货提示**: 概览按 `领用量 - 退料量` 统计净消耗排名, 并列出库存低于安全库存的备件与建议补货缺口。
+- **删除维修记录** 会先把仍挂账的领用备件按数量回退入库(写回退流水), 再删除维修单并重算故障的 `repair_count` / `latest_repair_id`, 次数归零时把故障从 `维修中` 回退到 `待处理`。
+- **删除路灯** 会被未闭环故障拦截; **删除故障** 要求已关闭且没有维修记录; **删除备件** 要求库存为零且没有任何出入库流水, 否则只能停用。
 - **逾期判定**: 上报超过 24 小时仍未闭环的故障计入概览的逾期清单。
 
 ---
@@ -313,6 +344,7 @@ go test ./...
 
 - 6 条道路, 每条 5 盏路灯, 共 **30 盏**, 覆盖 `正常 / 故障 / 维修中 / 停用` 四种运行状态;
 - **14 条故障**, 覆盖待处理 / 维修中 / 已修复 / 已关闭四种状态, 其中包含 2 条已逾期;
-- **12 条维修记录**, 含进行中与已完工, 带耗材、费用与维修结果。
+- **12 条维修记录**, 含进行中与已完工, 带费用与维修结果;
+- **12 种备件与耗材**, 期初库存独立建账, 维修场景中包含自动领用扣减、退料回库(如线径不符整批退回)与现场报废(如旧胶带、拆碎外壳), 开箱即可看到备件消耗排名与 4 项缺货预警。
 
 想从空库开始, 把 `APP_SEED` 设为 `false`, 或删除数据卷后重启。

@@ -59,10 +59,19 @@
         <el-table-column label="费用" width="100">
           <template #default="{ row }">{{ formatMoney(row.cost) }}</template>
         </el-table-column>
-        <el-table-column prop="content" label="维修内容" min-width="180" show-overflow-tooltip />
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column prop="content" label="维修内容" min-width="160" show-overflow-tooltip />
+        <el-table-column label="领用备件" width="110">
+          <template #default="{ row }">
+            <el-button v-if="row.materials_detail?.length" link type="primary" @click="openMaterials(row)">
+              {{ row.materials_detail.length }} 种
+            </el-button>
+            <span v-else class="text-muted">-</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="290" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openDetail(row)">故障详情</el-button>
+            <el-button v-if="row.materials_detail?.length" link type="warning" @click="openMaterials(row)">用料</el-button>
             <el-button v-if="row.status === 'ongoing'" link type="success" @click="openFinish(row)">完成维修</el-button>
             <el-button v-if="row.status === 'ongoing'" link type="primary" @click="openEdit(row)">编辑</el-button>
             <el-button link type="danger" @click="handleDelete(row)">删除</el-button>
@@ -81,6 +90,7 @@
     <RepairFormDialog v-model="formVisible" :model="editing" @saved="handleSaved" />
     <FinishRepairDialog v-model="finishVisible" :model="finishing" @saved="handleSaved" />
     <FaultDetailDrawer v-model="detailVisible" :fault-id="activeFaultId" />
+    <RepairMaterialsDrawer v-model="materialsVisible" :repair="materialsRepair" @saved="handleSaved" />
   </div>
 </template>
 
@@ -94,6 +104,7 @@ import StatusTag from '@/components/common/StatusTag.vue'
 import DataPagination from '@/components/common/DataPagination.vue'
 import RepairFormDialog from './components/RepairFormDialog.vue'
 import FinishRepairDialog from './components/FinishRepairDialog.vue'
+import RepairMaterialsDrawer from './components/RepairMaterialsDrawer.vue'
 import FaultDetailDrawer from '@/views/fault/components/FaultDetailDrawer.vue'
 import { repairApi } from '@/api/repair'
 import { useDictStore } from '@/stores/dict'
@@ -118,9 +129,11 @@ const dateRange = ref([])
 const formVisible = ref(false)
 const finishVisible = ref(false)
 const detailVisible = ref(false)
+const materialsVisible = ref(false)
 const editing = ref(null)
 const finishing = ref(null)
 const activeFaultId = ref(null)
+const materialsRepair = ref(null)
 
 function applyDateRange() {
   query.start_date = dateRange.value?.[0] ?? ''
@@ -155,6 +168,11 @@ function openFinish(row) {
 function openDetail(row) {
   activeFaultId.value = row.fault_id
   detailVisible.value = true
+}
+
+function openMaterials(row) {
+  materialsRepair.value = { ...row }
+  materialsVisible.value = true
 }
 
 async function handleDelete(row) {
