@@ -12,6 +12,7 @@ import (
 	"streetlight/internal/apperr"
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
+	"streetlight/internal/modules/parts"
 	"streetlight/internal/modules/repair"
 	"streetlight/pkg/pagination"
 )
@@ -55,11 +56,18 @@ type Service struct {
 	lamps   *lamp.Repository
 	faults  *fault.Repository
 	repairs *repair.Repository
+	parts   *parts.Repository
 }
 
 // NewService 构造维修状态查询服务。
-func NewService(db *gorm.DB, lamps *lamp.Repository, faults *fault.Repository, repairs *repair.Repository) *Service {
-	return &Service{db: db, lamps: lamps, faults: faults, repairs: repairs}
+func NewService(
+	db *gorm.DB,
+	lamps *lamp.Repository,
+	faults *fault.Repository,
+	repairs *repair.Repository,
+	partsRepo *parts.Repository,
+) *Service {
+	return &Service{db: db, lamps: lamps, faults: faults, repairs: repairs, parts: partsRepo}
 }
 
 // Overview 汇总维修状态看板数据。
@@ -136,6 +144,39 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 		return nil, err
 	}
 
+	// 备件库存概览: 总量/缺货, 消耗排名与缺货提示。
+	var (
+		partsKinds      int64
+		partsStock      int64
+		partsValue      float64
+		partsShortage   int64
+		partsOutOfStock int64
+		consumptionRank []parts.ConsumptionRank
+		shortageList    []parts.Part
+	)
+	if s.parts != nil {
+		partsKinds, err = s.parts.CountParts(ctx)
+		if err != nil {
+			return nil, err
+		}
+		partsStock, partsValue, err = s.parts.SumPartStock(ctx)
+		if err != nil {
+			return nil, err
+		}
+		partsShortage, partsOutOfStock, err = s.parts.CountShortage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		consumptionRank, err = s.parts.ConsumptionRanking(ctx, 10)
+		if err != nil {
+			return nil, err
+		}
+		shortageList, err = s.parts.ListShortage(ctx, 10)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	recentFaults, err := s.faults.ListRecent(ctx, 8)
 	if err != nil {
 		return nil, err
@@ -166,13 +207,22 @@ func (s *Service) Overview(ctx context.Context) (*Overview, error) {
 			AverageDurationHr: round2(averageDuration),
 			TotalCost:         round2(totalCost),
 		},
-		FaultByType:   topCounts(faultByType, 0),
-		FaultByLevel:  orderedCounts(faultByLevel, fault.Levels()),
-		TopRoads:      topCounts(faultByRoad, 5),
-		RecentFaults:  toBriefs(recentFaults),
-		OverdueFaults: toBriefs(overdueFaults),
-		OverdueHours:  OverdueThreshold.Hours(),
-		GeneratedAt:   now,
+		Parts: PartsSummary{
+			TotalKinds:      partsKinds,
+			TotalStock:      partsStock,
+			ShortageKinds:   partsShortage,
+			OutOfStockKinds: partsOutOfStock,
+			TotalStockValue: round2(partsValue),
+		},
+		FaultByType:     topCounts(faultByType, 0),
+		FaultByLevel:    orderedCounts(faultByLevel, fault.Levels()),
+		TopRoads:        topCounts(faultByRoad, 5),
+		RecentFaults:    toBriefs(recentFaults),
+		OverdueFaults:   toBriefs(overdueFaults),
+		PartConsumption: consumptionRank,
+		ShortageParts:   shortageList,
+		OverdueHours:    OverdueThreshold.Hours(),
+		GeneratedAt:     now,
 	}, nil
 }
 
@@ -316,6 +366,9 @@ func (s *Service) Track(ctx context.Context, query TrackQuery) (*TrackResult, er
 			if err != nil {
 				return nil, err
 			}
+			if err := s.attachRepairMaterials(ctx, repairs); err != nil {
+				return nil, err
+			}
 			result.Fault = &latest
 			result.Repairs = repairs
 			result.Timeline = buildTimeline(&latest, repairs)
@@ -337,6 +390,9 @@ func (s *Service) buildFaultTrack(ctx context.Context, entity *fault.Fault) (*Tr
 	if err != nil {
 		return nil, err
 	}
+	if err := s.attachRepairMaterials(ctx, repairs); err != nil {
+		return nil, err
+	}
 	return &TrackResult{
 		SearchType: "fault",
 		Lamp:       device,
@@ -344,6 +400,29 @@ func (s *Service) buildFaultTrack(ctx context.Context, entity *fault.Fault) (*Tr
 		Repairs:    repairs,
 		Timeline:   buildTimeline(entity, repairs),
 	}, nil
+}
+
+// attachRepairMaterials 为追踪视图中的维修记录补全备件用料明细。
+func (s *Service) attachRepairMaterials(ctx context.Context, repairs []repair.Repair) error {
+	if s.parts == nil || len(repairs) == 0 {
+		return nil
+	}
+	ids := make([]uint, 0, len(repairs))
+	for _, item := range repairs {
+		ids = append(ids, item.ID)
+	}
+	materials, err := s.parts.ListMaterialsByRepairs(ctx, ids)
+	if err != nil {
+		return err
+	}
+	grouped := make(map[uint][]parts.RepairMaterial, len(repairs))
+	for _, material := range materials {
+		grouped[material.RepairID] = append(grouped[material.RepairID], material)
+	}
+	for index := range repairs {
+		repairs[index].MaterialItems = grouped[repairs[index].ID]
+	}
+	return nil
 }
 
 // countFaultsByLamp 批量统计每盏路灯的故障数量, openOnly 为 true 时仅统计未闭环故障。

@@ -59,6 +59,25 @@
         <el-table-column label="费用" width="100">
           <template #default="{ row }">{{ formatMoney(row.cost) }}</template>
         </el-table-column>
+        <el-table-column label="领用备件" min-width="160">
+          <template #default="{ row }">
+            <el-popover v-if="row.material_items && row.material_items.length" :width="320" trigger="hover">
+              <template #reference>
+                <el-button link type="primary">
+                  {{ row.material_items.length }} 种 / {{ sumMaterialQty(row.material_items) }} 件
+                </el-button>
+              </template>
+              <el-table :data="row.material_items" size="small" border>
+                <el-table-column prop="part_code" label="编号" width="90" />
+                <el-table-column prop="part_name" label="名称" min-width="120" show-overflow-tooltip />
+                <el-table-column label="数量" width="80">
+                  <template #default="{ row: item }">{{ item.quantity }} {{ item.unit }}</template>
+                </el-table-column>
+              </el-table>
+            </el-popover>
+            <span v-else class="text-muted">-</span>
+          </template>
+        </el-table-column>
         <el-table-column prop="content" label="维修内容" min-width="180" show-overflow-tooltip />
         <el-table-column label="操作" width="240" fixed="right">
           <template #default="{ row }">
@@ -125,6 +144,10 @@ const activeFaultId = ref(null)
 function applyDateRange() {
   query.start_date = dateRange.value?.[0] ?? ''
   query.end_date = dateRange.value?.[1] ?? ''
+}
+
+function sumMaterialQty(items) {
+  return (items ?? []).reduce((total, item) => total + Number(item.quantity || 0), 0)
 }
 
 function handleSearch() {

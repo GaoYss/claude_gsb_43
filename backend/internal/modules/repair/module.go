@@ -3,6 +3,8 @@ package repair
 import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+
+	"streetlight/internal/modules/parts"
 )
 
 // Module 维修记录模块, 负责维修过程录入与完工闭环。
@@ -12,16 +14,19 @@ type Module struct {
 	handler    *Handler
 }
 
-// New 构造维修记录模块, faults 为故障模块提供的端口实现。
-func New(db *gorm.DB, faults FaultPort) *Module {
+// New 构造维修记录模块, faults 为故障模块端口, partsPort 为备件库存模块端口。
+func New(db *gorm.DB, faults FaultPort, partsPort PartsPort) *Module {
 	repository := NewRepository(db)
-	service := NewService(repository, faults)
+	service := NewService(repository, faults, partsPort)
 	return &Module{
 		repository: repository,
 		service:    service,
 		handler:    NewHandler(service),
 	}
 }
+
+// 确保 parts.Service 实现维修模块要求的备件端口。
+var _ PartsPort = (*parts.Service)(nil)
 
 // Repository 暴露仓储, 供状态查询模块装配。
 func (m *Module) Repository() *Repository { return m.repository }

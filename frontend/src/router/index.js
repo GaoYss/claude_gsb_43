@@ -32,6 +32,12 @@ const routes = [
         meta: { title: '维修记录录入', icon: 'Tools' },
       },
       {
+        path: 'parts',
+        name: 'parts',
+        component: () => import('@/views/parts/PartListView.vue'),
+        meta: { title: '备件耗材库存', icon: 'Box' },
+      },
+      {
         path: 'status',
         name: 'status',
         component: () => import('@/views/status/StatusLampView.vue'),

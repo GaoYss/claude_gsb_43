@@ -9,6 +9,7 @@ import (
 
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
+	"streetlight/internal/modules/parts"
 	"streetlight/internal/modules/repair"
 )
 
@@ -24,6 +25,13 @@ type seedRepairCase struct {
 	content     string
 	materials   string
 	cost        float64
+	parts       []seedPartUsage // 开工领用的备件, 与备件库存联动
+}
+
+// seedPartUsage 描述一次维修领用的一种备件数量。
+type seedPartUsage struct {
+	code string
+	qty  int
 }
 
 // seedFaultCase 描述一条演示故障记录。
@@ -56,6 +64,15 @@ func seed(db *gorm.DB) error {
 		return fmt.Errorf("写入路灯台账演示数据失败: %w", err)
 	}
 
+	partCatalog := buildSeedParts()
+	if err := db.Create(&partCatalog).Error; err != nil {
+		return fmt.Errorf("写入备件台账演示数据失败: %w", err)
+	}
+	partByCode := make(map[string]*parts.Part, len(partCatalog))
+	for index := range partCatalog {
+		partByCode[partCatalog[index].Code] = &partCatalog[index]
+	}
+
 	cases := seedFaultCases()
 	faults := make([]fault.Fault, 0, len(cases))
 	sequences := map[string]int{}
@@ -86,6 +103,7 @@ func seed(db *gorm.DB) error {
 
 	repairs := make([]repair.Repair, 0)
 	repairRanges := make([][2]int, len(cases))
+	partUsage := make([]seedPartIssue, 0)
 	sequences = map[string]int{}
 	for index, item := range cases {
 		device := lamps[item.lampIndex]
@@ -95,6 +113,7 @@ func seed(db *gorm.DB) error {
 			prefix := "WX" + startedAt.Format("20060102")
 			sequences[prefix]++
 
+			repairIndex := len(repairs)
 			record := repair.Repair{
 				RepairNo:     fmt.Sprintf("%s%04d", prefix, sequences[prefix]),
 				FaultID:      faults[index].ID,
@@ -117,6 +136,13 @@ func seed(db *gorm.DB) error {
 				record.Result = expect.result
 			}
 			repairs = append(repairs, record)
+			for _, usage := range expect.parts {
+				partUsage = append(partUsage, seedPartIssue{
+					repairIndex: repairIndex,
+					partCode:    usage.code,
+					quantity:    usage.qty,
+				})
+			}
 		}
 		repairRanges[index] = [2]int{start, len(repairs)}
 	}
@@ -124,6 +150,10 @@ func seed(db *gorm.DB) error {
 		if err := db.Create(&repairs).Error; err != nil {
 			return fmt.Errorf("写入维修记录演示数据失败: %w", err)
 		}
+	}
+
+	if err := seedPartLedger(db, now, partByCode, partUsage, repairs); err != nil {
+		return err
 	}
 
 	for index, item := range cases {
@@ -150,8 +180,126 @@ func seed(db *gorm.DB) error {
 		"路灯", len(lamps),
 		"故障", len(faults),
 		"维修记录", len(repairs),
+		"备件", len(partCatalog),
+		"库存流水/用料", len(partUsage),
 	)
 	return nil
+}
+
+// seedPartIssue 描述一条维修记录领用的一种备件(通过维修记录在切片中的下标关联)。
+type seedPartIssue struct {
+	repairIndex int
+	partCode    string
+	quantity    int
+}
+
+// seedPartLedger 依据维修领用关系生成期初入库/开工领用流水、用料明细, 并回写期末库存。
+func seedPartLedger(
+	db *gorm.DB,
+	now time.Time,
+	partByCode map[string]*parts.Part,
+	issues []seedPartIssue,
+	repairs []repair.Repair,
+) error {
+	openingAt := now.Add(-60 * 24 * time.Hour)
+	openingPrefix := "KC" + openingAt.Format("20060102")
+	flows := make([]parts.StockTx, 0, len(partByCode)+len(issues))
+	openingSeq := 0
+	for _, part := range partByCode {
+		if part.Stock <= 0 {
+			continue
+		}
+		openingSeq++
+		flows = append(flows, parts.StockTx{
+			TxNo:       fmt.Sprintf("%s%04d", openingPrefix, openingSeq),
+			PartID:     part.ID,
+			PartCode:   part.Code,
+			PartName:   part.Name,
+			Type:       parts.TxInbound,
+			Quantity:   part.Stock,
+			StockAfter: part.Stock,
+			Reason:     "期初库存入库",
+			Operator:   "仓管员",
+			OccurredAt: openingAt,
+		})
+	}
+
+	materials := make([]parts.RepairMaterial, 0, len(issues))
+	issueSeq := map[string]int{}
+	for _, issue := range issues {
+		part := partByCode[issue.partCode]
+		if part == nil || issue.quantity <= 0 {
+			continue
+		}
+		record := repairs[issue.repairIndex]
+		part.Stock -= issue.quantity
+		prefix := "KC" + record.StartedAt.Format("20060102")
+		issueSeq[prefix]++
+		repairID := record.ID
+		flows = append(flows, parts.StockTx{
+			TxNo:       fmt.Sprintf("%s%04d", prefix, issueSeq[prefix]),
+			PartID:     part.ID,
+			PartCode:   part.Code,
+			PartName:   part.Name,
+			Type:       parts.TxIssue,
+			Quantity:   issue.quantity,
+			StockAfter: part.Stock,
+			RepairID:   &repairID,
+			RepairNo:   record.RepairNo,
+			FaultNo:    record.FaultNo,
+			Reason:     fmt.Sprintf("维修开工领用 %s", record.RepairNo),
+			Operator:   record.Repairman,
+			OccurredAt: record.StartedAt,
+		})
+		materials = append(materials, parts.RepairMaterial{
+			RepairID:  record.ID,
+			PartID:    part.ID,
+			PartCode:  part.Code,
+			PartName:  part.Name,
+			Unit:      part.Unit,
+			Quantity:  issue.quantity,
+			UnitPrice: part.UnitPrice,
+		})
+	}
+
+	if len(flows) > 0 {
+		if err := db.Create(&flows).Error; err != nil {
+			return fmt.Errorf("写入备件库存流水演示数据失败: %w", err)
+		}
+	}
+	if len(materials) > 0 {
+		if err := db.Create(&materials).Error; err != nil {
+			return fmt.Errorf("写入维修用料明细演示数据失败: %w", err)
+		}
+	}
+	for _, part := range partByCode {
+		if err := db.Model(&parts.Part{}).Where("id = ?", part.ID).Update("stock", part.Stock).Error; err != nil {
+			return fmt.Errorf("回写备件期末库存失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// buildSeedParts 生成备件与耗材台账, 库存量按演示维修领用后仍能体现正常/预警/缺货三种状态。
+func buildSeedParts() []parts.Part {
+	catalog := []parts.Part{
+		{Code: "BJ-00001", Name: "LED 驱动电源", Category: "电器件", Specification: "150W 恒流防水", Unit: "个", Stock: 3, SafetyStock: 2, UnitPrice: 120, Supplier: "明微电子", Location: "A 区 01 架"},
+		{Code: "BJ-00002", Name: "LED 灯头总成", Category: "灯具", Specification: "120W 模组灯头", Unit: "套", Stock: 1, SafetyStock: 1, UnitPrice: 320, Supplier: "华日照明", Location: "A 区 02 架"},
+		{Code: "BJ-00003", Name: "基础法兰", Category: "结构件", Specification: "M24 四孔", Unit: "套", Stock: 2, SafetyStock: 1, UnitPrice: 85, Supplier: "永固钢构", Location: "C 区 01 架"},
+		{Code: "BJ-00004", Name: "熔断器", Category: "电器件", Specification: "RT18-32 10A", Unit: "只", Stock: 20, SafetyStock: 5, UnitPrice: 6, Supplier: "正泰电器", Location: "A 区 03 架"},
+		{Code: "BJ-00005", Name: "通讯模块", Category: "控制件", Specification: "4G Cat.1 双模", Unit: "个", Stock: 4, SafetyStock: 2, UnitPrice: 260, Supplier: "移远通信", Location: "B 区 01 架"},
+		{Code: "BJ-00006", Name: "防水接线接头", Category: "耗材", Specification: "PG16 尼龙防水", Unit: "套", Stock: 5, SafetyStock: 4, UnitPrice: 9, Supplier: "联塑管业", Location: "D 区 01 架"},
+		{Code: "BJ-00007", Name: "地埋电缆", Category: "线缆", Specification: "YJV 3x2.5", Unit: "米", Stock: 200, SafetyStock: 100, UnitPrice: 14, Supplier: "远东电缆", Location: "E 区 01 区"},
+		{Code: "BJ-00008", Name: "热缩管套件", Category: "耗材", Specification: "Φ20 四件套", Unit: "套", Stock: 10, SafetyStock: 6, UnitPrice: 8, Supplier: "长园电子", Location: "D 区 02 架"},
+		{Code: "BJ-00009", Name: "交流接触器", Category: "电器件", Specification: "CJX2-2510 220V", Unit: "只", Stock: 6, SafetyStock: 2, UnitPrice: 48, Supplier: "德力西", Location: "A 区 04 架"},
+		{Code: "BJ-00010", Name: "绝缘胶带", Category: "耗材", Specification: "PVC 18mmx20m", Unit: "卷", Stock: 15, SafetyStock: 5, UnitPrice: 3, Supplier: "3M", Location: "D 区 03 架"},
+		{Code: "BJ-00011", Name: "高压钠灯镇流器", Category: "电器件", Specification: "150W 电感镇流", Unit: "个", Stock: 0, SafetyStock: 2, UnitPrice: 95, Supplier: "亚明照明", Location: "A 区 05 架"},
+		{Code: "BJ-00012", Name: "时控开关", Category: "控制件", Specification: "KG316T 经纬度", Unit: "只", Stock: 30, SafetyStock: 5, UnitPrice: 55, Supplier: "正泰电器", Location: "B 区 02 架"},
+	}
+	for index := range catalog {
+		catalog[index].Remark = "演示数据"
+	}
+	return catalog
 }
 
 // buildSeedLamps 生成 6 条道路共 30 盏路灯的台账数据。
@@ -225,7 +373,8 @@ func seedFaultCases() []seedFaultCase {
 				{
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 2 * hour,
 					content: "已到场排查, 确认电缆接头烧蚀, 正在更换接头", materials: "防水接头 2 套",
-					cost: 180,
+					cost:  180,
+					parts: []seedPartUsage{{code: "BJ-00006", qty: 2}},
 				},
 			},
 		},
@@ -237,6 +386,7 @@ func seedFaultCases() []seedFaultCase {
 				{
 					repairman: "陈鹏", team: "市政照明二班", startedAgo: 1 * hour,
 					content: "检查控制箱通讯模块, 疑似模块损坏", materials: "通讯模块 1 个", cost: 260,
+					parts: []seedPartUsage{{code: "BJ-00005", qty: 1}},
 				},
 			},
 		},
@@ -249,6 +399,7 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 25 * hour, finishedAgo: 20 * hour,
 					result: repair.ResultFixed, content: "更换 LED 驱动电源并复测绝缘",
 					materials: "驱动电源 1 个", cost: 220,
+					parts: []seedPartUsage{{code: "BJ-00001", qty: 1}},
 				},
 			},
 		},
@@ -261,6 +412,7 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "周涛", team: "市政照明二班", startedAgo: 48 * hour, finishedAgo: 44 * hour,
 					result: repair.ResultFixed, content: "更换灯头总成并密封处理",
 					materials: "LED 灯头 1 套", cost: 460,
+					parts: []seedPartUsage{{code: "BJ-00002", qty: 1}},
 				},
 			},
 		},
@@ -273,6 +425,7 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "周涛", team: "市政照明二班", startedAgo: 70 * hour, finishedAgo: 60 * hour,
 					result: repair.ResultFixed, content: "重新浇筑基础法兰并校正灯杆垂直度",
 					materials: "基础法兰 1 套", cost: 980,
+					parts: []seedPartUsage{{code: "BJ-00003", qty: 1}},
 				},
 			},
 		},
@@ -285,6 +438,7 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "陈鹏", team: "市政照明一班", startedAgo: 94 * hour, finishedAgo: 90 * hour,
 					result: repair.ResultFixed, content: "更换熔断器并紧固接线端子",
 					materials: "熔断器 1 只", cost: 60,
+					parts: []seedPartUsage{{code: "BJ-00004", qty: 1}},
 				},
 			},
 		},
@@ -297,6 +451,7 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 118 * hour, finishedAgo: 112 * hour,
 					result: repair.ResultFixed, content: "更换驱动电源, 频闪消除",
 					materials: "驱动电源 1 个", cost: 220,
+					parts: []seedPartUsage{{code: "BJ-00001", qty: 1}},
 				},
 			},
 		},
@@ -309,11 +464,13 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "周涛", team: "市政照明二班", startedAgo: 148 * hour, finishedAgo: 140 * hour,
 					result: repair.ResultPendingParts, content: "检测确认需整段更换电缆, 等待物料到场",
 					materials: "电缆 40 米", cost: 120,
+					parts: []seedPartUsage{{code: "BJ-00007", qty: 40}},
 				},
 				{
 					repairman: "周涛", team: "市政照明二班", startedAgo: 130 * hour, finishedAgo: 120 * hour,
 					result: repair.ResultFixed, content: "更换老化电缆并做绝缘测试, 测试合格",
 					materials: "电缆 40 米, 热缩管 4 套", cost: 1560,
+					parts: []seedPartUsage{{code: "BJ-00007", qty: 40}, {code: "BJ-00008", qty: 4}},
 				},
 			},
 		},
@@ -326,6 +483,7 @@ func seedFaultCases() []seedFaultCase {
 					repairman: "陈鹏", team: "市政照明二班", startedAgo: 9 * hour, finishedAgo: 7 * hour,
 					result: repair.ResultFixed, content: "更换接触器, 恢复远程开关灯控制",
 					materials: "交流接触器 1 只", cost: 150,
+					parts: []seedPartUsage{{code: "BJ-00009", qty: 1}},
 				},
 			},
 		},

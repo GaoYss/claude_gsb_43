@@ -54,6 +54,14 @@
         color="#409eff"
         :hint="`故障累计 ${overview.fault.total} 条`"
       />
+      <StatCard
+        label="备件缺货预警"
+        :value="overview.parts.shortage_kinds"
+        suffix="种"
+        icon="Box"
+        color="#f56c6c"
+        :hint="`零库存 ${overview.parts.out_of_stock_kinds} 种 / 共 ${overview.parts.total_kinds} 种`"
+      />
     </div>
 
     <el-row :gutter="16">
@@ -123,6 +131,59 @@
       <div class="section-title">故障高发道路 TOP5</div>
       <BarList :items="overview.top_roads" />
     </el-card>
+
+    <el-row :gutter="16">
+      <el-col :xs="24" :md="12">
+        <el-card shadow="never">
+          <div class="section-title">
+            <span>备件消耗排名 TOP10</span>
+            <el-button link type="primary" @click="$router.push('/parts')">库存台账</el-button>
+          </div>
+          <el-table :data="overview.part_consumption" size="small">
+            <el-table-column type="index" label="#" width="44" />
+            <el-table-column prop="part_code" label="备件编号" width="110" />
+            <el-table-column prop="part_name" label="备件名称" min-width="130" show-overflow-tooltip />
+            <el-table-column label="领用量" width="110">
+              <template #default="{ row }">
+                <span class="qty-strong">{{ row.total_qty }} {{ row.unit }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="涉及维修" width="90">
+              <template #default="{ row }">{{ row.repair_count }} 次</template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-if="!overview.part_consumption?.length" description="暂无领用记录" :image-size="60" />
+        </el-card>
+      </el-col>
+      <el-col :xs="24" :md="12">
+        <el-card shadow="never">
+          <div class="section-title">
+            <span>缺货 / 库存预警</span>
+            <el-tag type="danger" effect="plain" size="small">{{ overview.parts.shortage_kinds }} 种待补货</el-tag>
+          </div>
+          <el-table :data="overview.shortage_parts" size="small" @row-click="goParts">
+            <el-table-column prop="code" label="备件编号" width="110" />
+            <el-table-column prop="name" label="备件名称" min-width="130" show-overflow-tooltip />
+            <el-table-column label="当前库存" width="100">
+              <template #default="{ row }">
+                <span :class="row.stock <= 0 ? 'stock-danger' : 'stock-warning'">
+                  {{ row.stock }} {{ row.unit }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column label="安全库存" width="100">
+              <template #default="{ row }">{{ row.safety_stock }} {{ row.unit }}</template>
+            </el-table-column>
+            <el-table-column label="状态" width="90">
+              <template #default="{ row }">
+                <StatusTag :dict="PART_STOCK_STATUS" :value="partStockKey(row.stock, row.safety_stock)" />
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-empty v-if="!overview.shortage_parts?.length" description="库存充足, 暂无预警" :image-size="60" />
+        </el-card>
+      </el-col>
+    </el-row>
   </div>
 </template>
 
@@ -135,7 +196,7 @@ import StatCard from '@/components/common/StatCard.vue'
 import BarList from '@/components/common/BarList.vue'
 import StatusTag from '@/components/common/StatusTag.vue'
 import { statusApi } from '@/api/status'
-import { FAULT_LEVEL, FAULT_STATUS, RUN_STATUS } from '@/constants/dict'
+import { FAULT_LEVEL, FAULT_STATUS, RUN_STATUS, PART_STOCK_STATUS, partStockKey } from '@/constants/dict'
 import { formatWaiting } from '@/utils/format'
 
 const router = useRouter()
@@ -145,11 +206,14 @@ const emptyOverview = () => ({
   lamp: { total: 0, road_count: 0, by_run_status: {} },
   fault: { total: 0, open_total: 0, by_status: {}, today_reported: 0, overdue_total: 0 },
   repair: { total: 0, ongoing_total: 0, finished_total: 0, today_finished: 0, average_duration_hours: 0, total_cost: 0 },
+  parts: { total_kinds: 0, total_stock: 0, shortage_kinds: 0, out_of_stock_kinds: 0, total_stock_value: 0 },
   fault_by_type: [],
   fault_by_level: [],
   top_roads: [],
   recent_faults: [],
   overdue_faults: [],
+  part_consumption: [],
+  shortage_parts: [],
   overdue_threshold_hours: 24,
 })
 
@@ -187,5 +251,26 @@ function goTrack(row) {
   router.push({ path: '/status/track', query: { fault_no: row.fault_no } })
 }
 
+function goParts() {
+  router.push('/parts')
+}
+
 onMounted(load)
 </script>
+
+<style scoped>
+.qty-strong {
+  font-weight: 600;
+  color: var(--el-color-primary);
+}
+
+.stock-danger {
+  color: var(--el-color-danger);
+  font-weight: 600;
+}
+
+.stock-warning {
+  color: var(--el-color-warning);
+  font-weight: 600;
+}
+</style>

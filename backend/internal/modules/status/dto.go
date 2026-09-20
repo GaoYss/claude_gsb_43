@@ -5,6 +5,7 @@ import (
 
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
+	"streetlight/internal/modules/parts"
 	"streetlight/internal/modules/repair"
 )
 
@@ -53,18 +54,30 @@ type RepairSummary struct {
 	TotalCost         float64 `json:"total_cost"`
 }
 
+// PartsSummary 备件库存概览。
+type PartsSummary struct {
+	TotalKinds      int64   `json:"total_kinds"`
+	TotalStock      int64   `json:"total_stock"`
+	ShortageKinds   int64   `json:"shortage_kinds"`
+	OutOfStockKinds int64   `json:"out_of_stock_kinds"`
+	TotalStockValue float64 `json:"total_stock_value"`
+}
+
 // Overview 维修状态总览看板。
 type Overview struct {
-	Lamp          LampSummary  `json:"lamp"`
-	Fault         FaultSummary `json:"fault"`
-	Repair        RepairSummary `json:"repair"`
-	FaultByType   []LabelCount  `json:"fault_by_type"`
-	FaultByLevel  []LabelCount  `json:"fault_by_level"`
-	TopRoads      []LabelCount  `json:"top_roads"`
-	RecentFaults  []FaultBrief  `json:"recent_faults"`
-	OverdueFaults []FaultBrief  `json:"overdue_faults"`
-	OverdueHours  float64       `json:"overdue_threshold_hours"`
-	GeneratedAt   time.Time     `json:"generated_at"`
+	Lamp            LampSummary             `json:"lamp"`
+	Fault           FaultSummary            `json:"fault"`
+	Repair          RepairSummary           `json:"repair"`
+	Parts           PartsSummary            `json:"parts"`
+	FaultByType     []LabelCount            `json:"fault_by_type"`
+	FaultByLevel    []LabelCount            `json:"fault_by_level"`
+	TopRoads        []LabelCount            `json:"top_roads"`
+	RecentFaults    []FaultBrief            `json:"recent_faults"`
+	OverdueFaults   []FaultBrief            `json:"overdue_faults"`
+	PartConsumption []parts.ConsumptionRank `json:"part_consumption"`
+	ShortageParts   []parts.Part            `json:"shortage_parts"`
+	OverdueHours    float64                 `json:"overdue_threshold_hours"`
+	GeneratedAt     time.Time               `json:"generated_at"`
 }
 
 // LampStatusRow 是"维修状态查询"列表中的一行: 一盏路灯的当前维修进展。
@@ -101,10 +114,10 @@ type TimelineEvent struct {
 
 // TrackResult 是单条故障(或单盏路灯)的完整处理链路。
 type TrackResult struct {
-	SearchType    string            `json:"search_type"`
-	Lamp          *lamp.Lamp        `json:"lamp,omitempty"`
-	Fault         *fault.Fault      `json:"fault,omitempty"`
-	Repairs       []repair.Repair   `json:"repairs"`
-	Timeline      []TimelineEvent   `json:"timeline"`
-	RelatedFaults []FaultBrief      `json:"related_faults,omitempty"`
+	SearchType    string          `json:"search_type"`
+	Lamp          *lamp.Lamp      `json:"lamp,omitempty"`
+	Fault         *fault.Fault    `json:"fault,omitempty"`
+	Repairs       []repair.Repair `json:"repairs"`
+	Timeline      []TimelineEvent `json:"timeline"`
+	RelatedFaults []FaultBrief    `json:"related_faults,omitempty"`
 }

@@ -41,9 +41,18 @@ func (r *Repository) session(ctx context.Context) *gorm.DB {
 	return r.db.WithContext(ctx)
 }
 
+// Transaction 在一个数据库事务中执行 fn, fn 内统一使用返回的 tx。
+func (r *Repository) Transaction(ctx context.Context, fn func(tx *gorm.DB) error) error {
+	return r.session(ctx).Transaction(fn)
+}
+
 // Create 新增维修记录。
 func (r *Repository) Create(ctx context.Context, entity *Repair) error {
-	if err := r.session(ctx).Create(entity).Error; err != nil {
+	return r.create(r.session(ctx), entity)
+}
+
+func (r *Repository) create(statement *gorm.DB, entity *Repair) error {
+	if err := statement.Create(entity).Error; err != nil {
 		return fmt.Errorf("录入维修记录失败: %w", err)
 	}
 	return nil
@@ -51,13 +60,22 @@ func (r *Repository) Create(ctx context.Context, entity *Repair) error {
 
 // CreateWithUniqueNo 生成唯一维修单号并落库, 冲突时自动重试。
 func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Repair, prefix string) error {
+	return r.createWithUniqueNo(r.session(ctx), entity, prefix)
+}
+
+// CreateWithUniqueNoTx 在给定事务内生成唯一维修单号并落库。
+func (r *Repository) CreateWithUniqueNoTx(tx *gorm.DB, entity *Repair, prefix string) error {
+	return r.createWithUniqueNo(tx, entity, prefix)
+}
+
+func (r *Repository) createWithUniqueNo(statement *gorm.DB, entity *Repair, prefix string) error {
 	for attempt := 0; attempt < 5; attempt++ {
-		sequence, err := r.NextSequence(ctx, prefix)
+		sequence, err := nextSequence(statement, prefix)
 		if err != nil {
 			return err
 		}
 		entity.RepairNo = fmt.Sprintf("%s%04d", prefix, sequence+attempt)
-		err = r.Create(ctx, entity)
+		err = r.create(statement, entity)
 		if err == nil {
 			return nil
 		}
@@ -70,8 +88,12 @@ func (r *Repository) CreateWithUniqueNo(ctx context.Context, entity *Repair, pre
 
 // NextSequence 返回指定前缀下可用的下一个流水号。
 func (r *Repository) NextSequence(ctx context.Context, prefix string) (int, error) {
+	return nextSequence(r.session(ctx), prefix)
+}
+
+func nextSequence(statement *gorm.DB, prefix string) (int, error) {
 	var latest string
-	err := r.session(ctx).Model(&Repair{}).
+	err := statement.Model(&Repair{}).
 		Where("repair_no LIKE ?", prefix+"%").
 		Order("repair_no DESC").
 		Limit(1).
@@ -99,7 +121,16 @@ func (r *Repository) Update(ctx context.Context, entity *Repair) error {
 
 // Delete 按主键删除维修记录。
 func (r *Repository) Delete(ctx context.Context, id uint) error {
-	if err := r.session(ctx).Delete(&Repair{}, id).Error; err != nil {
+	return r.delete(r.session(ctx), id)
+}
+
+// DeleteTx 在给定事务内按主键删除维修记录。
+func (r *Repository) DeleteTx(tx *gorm.DB, id uint) error {
+	return r.delete(tx, id)
+}
+
+func (r *Repository) delete(statement *gorm.DB, id uint) error {
+	if err := statement.Delete(&Repair{}, id).Error; err != nil {
 		return fmt.Errorf("删除维修记录失败: %w", err)
 	}
 	return nil
@@ -282,7 +313,7 @@ func (r *Repository) AverageDurationHours(ctx context.Context) (float64, error) 
 func (r *Repository) DistinctValues(ctx context.Context, column string) ([]string, error) {
 	values := make([]string, 0)
 	err := r.session(ctx).Model(&Repair{}).
-		Where(column + " <> ''").
+		Where(column+" <> ''").
 		Distinct().
 		Order(column).
 		Pluck(column, &values).Error

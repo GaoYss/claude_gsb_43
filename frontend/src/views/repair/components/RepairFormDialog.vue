@@ -78,8 +78,75 @@
             <el-input v-model="form.content" type="textarea" :rows="2" maxlength="512" show-word-limit placeholder="例如: 更换驱动电源并复测绝缘" />
           </el-form-item>
         </el-col>
+        <el-col :span="24">
+          <el-form-item label="领用备件">
+            <!-- 新增(开工): 可编辑备件清单, 保存即扣减库存 -->
+            <div v-if="!isEdit" class="material-block">
+              <el-table :data="materialRows" size="small" border>
+                <el-table-column label="备件" min-width="240">
+                  <template #default="{ row, $index }">
+                    <el-select
+                      v-model="row.part_id"
+                      filterable
+                      remote
+                      reserve-keyword
+                      :remote-method="(kw) => searchParts(kw)"
+                      :loading="partLoading"
+                      placeholder="输入编号 / 名称搜索备件"
+                      style="width: 100%"
+                      @change="(id) => handlePartChange(id, $index)"
+                    >
+                      <el-option
+                        v-for="item in partOptions"
+                        :key="item.id"
+                        :label="`${item.code} · ${item.name}${item.specification ? ' · ' + item.specification : ''}`"
+                        :value="item.id"
+                      >
+                        <span>{{ item.code }} · {{ item.name }}</span>
+                        <span class="part-stock" :class="partStockClass(item)">
+                          可用 {{ item.stock }} {{ item.unit }}
+                        </span>
+                      </el-option>
+                    </el-select>
+                  </template>
+                </el-table-column>
+                <el-table-column label="可用库存" width="110">
+                  <template #default="{ row }">
+                    <span v-if="row.part" :class="partStockClass(row.part)">
+                      {{ row.part.stock }} {{ row.part.unit }}
+                    </span>
+                    <span v-else class="text-muted">-</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="领用数量" width="140">
+                  <template #default="{ row }">
+                    <el-input-number v-model="row.quantity" :min="1" :step="1" size="small" style="width: 100%" />
+                  </template>
+                </el-table-column>
+                <el-table-column label="操作" width="80">
+                  <template #default="{ $index }">
+                    <el-button link type="danger" @click="removeMaterial($index)">移除</el-button>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <el-button class="material-add" :icon="Plus" size="small" @click="addMaterial">添加备件</el-button>
+              <div class="form-hint text-muted">开工保存时自动扣减库存; 任一备件库存不足将拦截开工并提示可用数量。</div>
+            </div>
+            <!-- 编辑: 已领用备件不可更改, 仅展示 -->
+            <el-table v-else :data="props.model?.material_items ?? []" size="small" border>
+              <el-table-column prop="part_code" label="备件编号" width="120" />
+              <el-table-column prop="part_name" label="备件名称" min-width="160" />
+              <el-table-column label="领用数量" width="120">
+                <template #default="{ row }">{{ row.quantity }} {{ row.unit }}</template>
+              </el-table-column>
+              <el-table-column label="单价" width="100">
+                <template #default="{ row }">{{ formatMoney(row.unit_price) }}</template>
+              </el-table-column>
+            </el-table>
+          </el-form-item>
+        </el-col>
         <el-col :span="16">
-          <el-form-item label="使用耗材" prop="materials">
+          <el-form-item label="耗材备注" prop="materials">
             <el-input v-model="form.materials" placeholder="例如: 驱动电源 1 个" />
           </el-form-item>
         </el-col>
@@ -106,11 +173,14 @@
 <script setup>
 import { computed, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { Plus } from '@element-plus/icons-vue'
 import StatusTag from '@/components/common/StatusTag.vue'
 import { faultApi } from '@/api/fault'
 import { repairApi } from '@/api/repair'
+import { partsApi } from '@/api/parts'
 import { useDictStore } from '@/stores/dict'
-import { FAULT_LEVEL, FAULT_STATUS } from '@/constants/dict'
+import { FAULT_LEVEL, FAULT_STATUS, partStockKey } from '@/constants/dict'
+import { formatMoney } from '@/utils/format'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -126,6 +196,9 @@ const submitting = ref(false)
 const faultLoading = ref(false)
 const faultCandidates = ref([])
 const selectedFault = ref(null)
+const partLoading = ref(false)
+const partOptions = ref([])
+const materialRows = ref([])
 
 const isEdit = computed(() => Boolean(props.model?.id))
 const lockedFault = computed(() => Boolean(props.fault?.id))
@@ -152,6 +225,57 @@ const rules = {
   repairman: [{ required: true, message: '请选择或输入维修人员', trigger: 'change' }],
 }
 
+// ---- 备件选择 ----
+async function searchParts(keyword = '') {
+  partLoading.value = true
+  try {
+    const data = await partsApi.list(
+      { keyword, page: 1, page_size: 20 },
+      { silent: true },
+    )
+    partOptions.value = data?.items ?? []
+  } catch (error) {
+    partOptions.value = []
+  } finally {
+    partLoading.value = false
+  }
+}
+
+function addMaterial() {
+  materialRows.value.push({ part_id: undefined, quantity: 1, part: null })
+}
+
+function removeMaterial(index) {
+  materialRows.value.splice(index, 1)
+}
+
+function handlePartChange(partID, index) {
+  const part = partOptions.value.find((item) => item.id === partID) ?? null
+  if (materialRows.value[index]) {
+    materialRows.value[index].part = part
+  }
+}
+
+function partStockClass(part) {
+  if (!part) return ''
+  const key = partStockKey(part.stock, part.safety_stock)
+  if (key === 'out') return 'stock-danger'
+  if (key === 'shortage') return 'stock-warning'
+  return 'stock-ok'
+}
+
+function collectMaterialItems() {
+  const seen = new Set()
+  const items = []
+  for (const row of materialRows.value) {
+    if (!row.part_id || row.quantity <= 0) continue
+    if (seen.has(row.part_id)) continue
+    seen.add(row.part_id)
+    items.push({ part_id: row.part_id, quantity: row.quantity })
+  }
+  return items
+}
+
 async function searchFaults(keyword = '') {
   faultLoading.value = true
   try {
@@ -172,6 +296,8 @@ function handleFaultChange(id) {
 async function syncForm() {
   Object.assign(form, createForm())
   selectedFault.value = null
+  materialRows.value = []
+  partOptions.value = []
 
   if (props.model) {
     Object.assign(form, {
@@ -196,15 +322,29 @@ async function syncForm() {
   if (props.fault) {
     form.fault_id = props.fault.id
     selectedFault.value = props.fault
-    return
+  } else {
+    await searchFaults('')
   }
-
-  await searchFaults('')
+  await searchParts('')
 }
 
 async function handleSubmit() {
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
+
+  if (!isEdit.value) {
+    // 前端先做一次库存校验, 给出友好提示; 服务端仍会强校验并拦截。
+    for (const row of materialRows.value) {
+      if (!row.part_id) {
+        ElMessage.warning('领用备件存在未选择的行, 请先选择备件或移除该行')
+        return
+      }
+      if (row.part && row.quantity > row.part.stock) {
+        ElMessage.error(`备件 ${row.part.name} 库存不足: 需领用 ${row.quantity}${row.part.unit}, 当前可用 ${row.part.stock}${row.part.unit}`)
+        return
+      }
+    }
+  }
 
   submitting.value = true
   try {
@@ -213,12 +353,13 @@ async function handleSubmit() {
       delete payload.started_at
     }
     if (isEdit.value) {
-      const { fault_id: _ignored, ...rest } = payload
+      const { fault_id: _ignored, material_items: _materials, ...rest } = payload
       await repairApi.update(props.model.id, rest)
       ElMessage.success('维修记录已更新')
     } else {
+      payload.material_items = collectMaterialItems()
       await repairApi.create(payload)
-      ElMessage.success('维修记录已录入, 故障状态更新为维修中')
+      ElMessage.success('维修记录已录入, 已领用扣减备件库存, 故障状态更新为维修中')
     }
     emit('update:modelValue', false)
     emit('saved')
@@ -231,5 +372,39 @@ async function handleSubmit() {
 <style scoped>
 .fault-summary {
   margin-bottom: 16px;
+}
+
+.material-block {
+  width: 100%;
+}
+
+.material-add {
+  margin-top: 8px;
+}
+
+.form-hint {
+  font-size: 12px;
+  line-height: 1.6;
+  margin-top: 6px;
+}
+
+.part-stock {
+  float: right;
+  font-size: 12px;
+  margin-left: 12px;
+}
+
+.stock-ok {
+  color: var(--el-color-success);
+}
+
+.stock-warning {
+  color: var(--el-color-warning);
+  font-weight: 600;
+}
+
+.stock-danger {
+  color: var(--el-color-danger);
+  font-weight: 600;
 }
 </style>

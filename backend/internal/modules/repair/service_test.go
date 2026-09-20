@@ -14,6 +14,7 @@ import (
 	"streetlight/internal/apperr"
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
+	"streetlight/internal/modules/parts"
 	"streetlight/internal/modules/repair"
 )
 
@@ -22,6 +23,7 @@ type harness struct {
 	lamps   *lamp.Service
 	faults  *fault.Service
 	repairs *repair.Service
+	parts   *parts.Service
 	db      *gorm.DB
 }
 
@@ -38,7 +40,8 @@ func newHarness(t *testing.T) *harness {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 
-	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
+	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{},
+		&parts.Part{}, &parts.StockTx{}, &parts.RepairMaterial{}))
 
 	lampRepository := lamp.NewRepository(db)
 	lampService := lamp.NewService(lampRepository)
@@ -47,10 +50,28 @@ func newHarness(t *testing.T) *harness {
 	faultService := fault.NewService(faultRepository, lampService)
 	lampService.SetOpenFaultCounter(faultRepository)
 
-	repairRepository := repair.NewRepository(db)
-	repairService := repair.NewService(repairRepository, faultService)
+	partsRepository := parts.NewRepository(db)
+	partsService := parts.NewService(partsRepository)
 
-	return &harness{lamps: lampService, faults: faultService, repairs: repairService, db: db}
+	repairRepository := repair.NewRepository(db)
+	repairService := repair.NewService(repairRepository, faultService, partsService)
+
+	return &harness{
+		lamps:   lampService,
+		faults:  faultService,
+		repairs: repairService,
+		parts:   partsService,
+		db:      db,
+	}
+}
+
+func (h *harness) createPart(t *testing.T, code, name string, stock, safety int) *parts.Part {
+	t.Helper()
+	entity, err := h.parts.CreatePart(context.Background(), parts.PartCreateRequest{
+		Code: code, Name: name, Unit: "个", Stock: &stock, SafetyStock: &safety,
+	})
+	require.NoError(t, err)
+	return entity
 }
 
 func (h *harness) createLamp(t *testing.T, code string) *lamp.Lamp {
@@ -237,4 +258,118 @@ func TestFaultValidation(t *testing.T) {
 	// 存在未闭环故障时不允许删除路灯
 	h.createFault(t, device.ID, "删除校验")
 	requireConflict(t, h.lamps.Delete(ctx, device.ID))
+}
+
+func TestRepairIssuePartsBlocksOnShortageAndRestoresOnDelete(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-T-005")
+	entity := h.createFault(t, device.ID, "更换驱动电源")
+
+	driver := h.createPart(t, "BJ-T-001", "LED 驱动电源", 2, 1)
+	fuse := h.createPart(t, "BJ-T-002", "熔断器", 10, 2)
+
+	// 库存不足时拦住开工, 错误信息带可用数量
+	_, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: entity.ID, Repairman: "维修工甲",
+		MaterialItems: []repair.RepairMaterialRequest{
+			{PartID: driver.ID, Quantity: 3},
+		},
+	})
+	requireConflict(t, err)
+	require.Contains(t, err.Error(), "可用 2")
+
+	// 备件未被动用
+	partAfterBlock, err := h.parts.GetPart(ctx, driver.ID)
+	require.NoError(t, err)
+	require.Equal(t, 2, partAfterBlock.Stock)
+
+	// 库存充足时开工, 自动扣减库存并保留用料明细
+	record, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: entity.ID, Repairman: "维修工甲",
+		MaterialItems: []repair.RepairMaterialRequest{
+			{PartID: driver.ID, Quantity: 2},
+			{PartID: fuse.ID, Quantity: 1},
+		},
+	})
+	require.NoError(t, err)
+
+	driverAfterIssue, err := h.parts.GetPart(ctx, driver.ID)
+	require.NoError(t, err)
+	require.Equal(t, 0, driverAfterIssue.Stock)
+	fuseAfterIssue, err := h.parts.GetPart(ctx, fuse.ID)
+	require.NoError(t, err)
+	require.Equal(t, 9, fuseAfterIssue.Stock)
+
+	materials, err := h.parts.ListMaterials(ctx, record.ID)
+	require.NoError(t, err)
+	require.Len(t, materials, 2)
+
+	detail, err := h.repairs.Get(ctx, record.ID)
+	require.NoError(t, err)
+	require.Len(t, detail.MaterialItems, 2)
+
+	// 删除维修记录自动冲销回补
+	require.NoError(t, h.repairs.Delete(ctx, record.ID))
+	driverAfterRestore, err := h.parts.GetPart(ctx, driver.ID)
+	require.NoError(t, err)
+	require.Equal(t, 2, driverAfterRestore.Stock)
+	fuseAfterRestore, err := h.parts.GetPart(ctx, fuse.ID)
+	require.NoError(t, err)
+	require.Equal(t, 10, fuseAfterRestore.Stock)
+}
+
+func TestPartReturnRequiresReasonAndRespectsIssuedQuantity(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	device := h.createLamp(t, "LD-T-006")
+	entity := h.createFault(t, device.ID, "灯不亮")
+	part := h.createPart(t, "BJ-T-003", "通讯模块", 5, 1)
+
+	record, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: entity.ID, Repairman: "维修工乙",
+		MaterialItems: []repair.RepairMaterialRequest{{PartID: part.ID, Quantity: 2}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, mustPart(t, h, part.ID).Stock)
+
+	// 退料必须登记原因
+	_, err = h.parts.CreateStockTx(ctx, parts.StockTxCreateRequest{
+		PartID: part.ID, Type: parts.TxReturn, Quantity: 1, RepairID: record.ID,
+	})
+	businessErr, ok := apperr.As(err)
+	require.True(t, ok)
+	require.Equal(t, http.StatusBadRequest, businessErr.Status)
+
+	// 正常退料回补库存
+	returnTx, err := h.parts.CreateStockTx(ctx, parts.StockTxCreateRequest{
+		PartID: part.ID, Type: parts.TxReturn, Quantity: 1, RepairID: record.ID,
+		Reason: "现场原模块仍可使用, 换新取消", Operator: "维修工乙",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4, returnTx.StockAfter)
+
+	// 退料数量不能超过领用量(已退 1, 再退 2 被拦截)
+	_, err = h.parts.CreateStockTx(ctx, parts.StockTxCreateRequest{
+		PartID: part.ID, Type: parts.TxReturn, Quantity: 2, RepairID: record.ID,
+		Reason: "超额退料",
+	})
+	requireConflict(t, err)
+
+	// 报废也必须登记原因, 且不能超过库存
+	_, err = h.parts.CreateStockTx(ctx, parts.StockTxCreateRequest{
+		PartID: part.ID, Type: parts.TxScrap, Quantity: 1,
+	})
+	require.Error(t, err)
+	_, err = h.parts.CreateStockTx(ctx, parts.StockTxCreateRequest{
+		PartID: part.ID, Type: parts.TxScrap, Quantity: 5, Reason: "运输损坏",
+	})
+	requireConflict(t, err)
+}
+
+func mustPart(t *testing.T, h *harness, id uint) *parts.Part {
+	t.Helper()
+	entity, err := h.parts.GetPart(context.Background(), id)
+	require.NoError(t, err)
+	return entity
 }

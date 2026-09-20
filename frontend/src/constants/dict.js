@@ -44,6 +44,29 @@ export const REPAIR_RESULT = {
   unfixable: { label: '无法修复', type: 'danger' },
 }
 
+// 库存变动类型。
+export const STOCK_TX_TYPE = {
+  issue: { label: '领用', type: 'warning' },
+  return: { label: '退料', type: 'primary' },
+  scrap: { label: '报废', type: 'danger' },
+  inbound: { label: '入库', type: 'success' },
+  writeback: { label: '冲销', type: 'info' },
+}
+
+// 备件库存状态(前端依据库存与安全库存推导)。
+export const PART_STOCK_STATUS = {
+  normal: { label: '充足', type: 'success' },
+  shortage: { label: '库存预警', type: 'warning' },
+  out: { label: '缺货', type: 'danger' },
+}
+
+// 依据库存量与安全库存推导库存状态键。
+export function partStockKey(stock, safetyStock) {
+  if (stock <= 0) return 'out'
+  if (stock <= safetyStock) return 'shortage'
+  return 'normal'
+}
+
 // 追踪时间线的节点名称。
 export const TIMELINE_STAGE = {
   reported: { label: '故障登记', type: 'primary' },

@@ -97,7 +97,26 @@
           <el-table-column label="耗时" width="120">
             <template #default="{ row }">{{ formatDuration(row.duration_minutes) }}</template>
           </el-table-column>
-          <el-table-column prop="materials" label="耗材" min-width="140" show-overflow-tooltip />
+          <el-table-column label="领用备件 / 耗材" min-width="170">
+            <template #default="{ row }">
+              <el-popover v-if="row.material_items?.length" :width="320" trigger="hover">
+                <template #reference>
+                  <el-button link type="primary">
+                    {{ row.material_items.length }} 种备件
+                  </el-button>
+                </template>
+                <el-table :data="row.material_items" size="small" border>
+                  <el-table-column prop="part_code" label="编号" width="90" />
+                  <el-table-column prop="part_name" label="名称" min-width="120" show-overflow-tooltip />
+                  <el-table-column label="数量" width="80">
+                    <template #default="{ row: item }">{{ item.quantity }} {{ item.unit }}</template>
+                  </el-table-column>
+                </el-table>
+              </el-popover>
+              <span v-else-if="row.materials">{{ row.materials }}</span>
+              <span v-else class="text-muted">-</span>
+            </template>
+          </el-table-column>
           <el-table-column label="费用" width="100">
             <template #default="{ row }">{{ formatMoney(row.cost) }}</template>
           </el-table-column>
